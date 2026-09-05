@@ -1,0 +1,19 @@
+{
+  "strategy_id": "GB-POWER-SPREAD-01",
+  "max_allowable_spread": 1.50,
+  "emergency_slice_size_mw": 10,
+  "legs": [
+    {
+      "leg_id": "LEG_SPOT_BUY",
+      "contract": "EPEX-GB-PEAK",
+      "target_volume": 10,
+      "limit_price": 65.00
+    },
+    {
+      "leg_id": "LEG_HEDGE_SELL",
+      "contract": "M7-GB-BASE",
+      "target_volume": 10,
+      "limit_price": 64.50
+    }
+  ]
+}
