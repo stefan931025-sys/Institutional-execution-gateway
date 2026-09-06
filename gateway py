@@ -4,10 +4,15 @@ import logging
 import os
 from dataclasses import dataclass, field
 from typing import List
+from fix_handler import AsyncFIXHandler
 
 # Configure logging for millisecond-level telemetry tracking
-logging.basicConfig(level=logging.INFO, format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-logger = logging.getLogger("ExecutionGateway")
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s", 
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger("InstitutionalGateway")
 
 @dataclass
 class LegOrder:
@@ -29,7 +34,15 @@ class InstitutionalExecutionGateway:
     def __init__(self, config_path: str = "config.json"):
         self.config_path = config_path
         self._ensure_config_exists()
-        self.config = self.load_configuration(self.config_path)
+        self.config = self._load_configuration(self.config_path)
+        
+        # Initialize FIX Client targeting the exchange gateway endpoint
+        self.fix_client = AsyncFIXHandler(
+            host="fix.exchange-sandbox.com",
+            port=9800,
+            sender_comp_id="DESK_RISK_01",
+            target_comp_id="EXCHANGE_MATCH"
+        )
         self.is_connected = False
 
     def _ensure_config_exists(self):
@@ -48,7 +61,7 @@ class InstitutionalExecutionGateway:
                     },
                     {
                         "leg_id": "LEG_HEDGE_SELL",
-                        "contract": "M7-GB-BASE",
+                        "contract": "NP-GB-BASE",
                         "target_volume": 10,
                         "limit_price": 64.50
                     }
@@ -58,12 +71,12 @@ class InstitutionalExecutionGateway:
                 json.dump(default_data, f, indent=4)
             logger.info(f"Initialized default configuration at {self.config_path}")
 
-    def load_configuration(self, path: str) -> SpreadStrategyConfig:
+    def _load_configuration(self, path: str) -> SpreadStrategyConfig:
         """Loads firm-specific execution parameters from configuration file."""
         logger.info(f"Loading execution configuration from {path}...")
         with open(path, "r") as f:
             data = json.load(f)
-        
+
         legs = [
             LegOrder(
                 leg_id=leg["leg_id"],
@@ -72,7 +85,7 @@ class InstitutionalExecutionGateway:
                 limit_price=leg["limit_price"]
             ) for leg in data["legs"]
         ]
-        
+
         return SpreadStrategyConfig(
             strategy_id=data["strategy_id"],
             max_allowable_spread=data["max_allowable_spread"],
@@ -80,49 +93,68 @@ class InstitutionalExecutionGateway:
             legs=legs
         )
 
-    async def handle_partial_fill(self, leg_id: str, executed_vol: int, execution_price: float):
+    async def handle_exchange_fill(self, cl_ord_id: str, executed_vol: float, execution_price: float):
         """
-        Triggered instantaneously upon leg execution to recalculate exposure 
-        and prevent manual re-pricing delays during system shocks.
+        Triggered instantaneously upon receiving an exchange fill confirmation over FIX
+        to update exposure and prevent re-pricing delays during system shocks.
         """
-        target_leg = next((l for l in self.config.legs if l.leg_id == leg_id), None)
-        if not target_leg:
-            logger.error(f"Leg {leg_id} not recognized under active configuration.")
-            return
+        logger.info(f"FIX FILL CONFIRMED [ClOrdID: {cl_ord_id}]: {executed_vol}MW matched at £{execution_price:.2f}.")
+        await self.rebalance_legs(trigger_cl_ord_id=cl_ord_id, filled_delta=executed_vol)
 
-        target_leg.filled_volume += executed_vol
-        target_leg.status = "FILLED" if target_leg.filled_volume >= target_leg.target_volume else "PARTIAL"
-        
-        logger.info(f"FILL DETECTED [{leg_id}]: {executed_vol}MW matched at £{execution_price:.2f}. Status: {target_leg.status}")
-
-        # Immediately execute automated risk-offsetting routine
-        await self.rebalance_legs(trigger_leg_id=leg_id, filled_delta=executed_vol)
-
-    async def rebalance_legs(self, trigger_leg_id: str, filled_delta: int):
-        """Neutralizes leg-risk by aggressively crossing the spread on offsetting contracts."""
-        logger.warning(f"Imbalance detected from {trigger_leg_id}. Dispatching automated defensive hedge...")
+    async def rebalance_legs(self, trigger_cl_ord_id: str, filled_delta: float):
+        """Neutralizes leg-risk by aggressively routing offsetting orders via FIX protocol."""
+        logger.warning(f"Imbalance detected from order {trigger_cl_ord_id}. Dispatching automated defensive hedge over FIX...")
 
         for leg in self.config.legs:
-            if leg.leg_id != trigger_leg_id and leg.status != "FILLED":
-                aggressive_price = leg.limit_price + 0.50  # Cross spread to ensure immediate execution
-                logger.info(f"HEDGING ACTION [{leg.leg_id}]: Adjusting size for {filled_delta}MW delta @ Target £{aggressive_price:.2f}")
-                
-                await asyncio.sleep(0.001)  # Simulate ultra-low latency API drop-copy roundtrip
-                leg.status = "FILLED"
-                logger.info(f"Offsetting leg {leg.leg_id} successfully secured. Leg-risk neutralized.")
+            # Route hedge order on the opposing leg
+            aggressive_price = leg.limit_price - 0.50  # Cross spread to ensure immediate execution
+            logger.info(f"HEDGING ACTION [{leg.leg_id}]: Dispatching {filled_delta}MW delta @ Target £{aggressive_price:.2f}")
+            
+            await self.fix_client.send_order(
+                symbol=leg.contract,
+                side="SELL",
+                qty=float(filled_delta),
+                price=aggressive_price
+            )
+            logger.info(f"Offsetting order for {leg.leg_id} successfully transmitted via FIX.")
 
-    async def run_simulation(self):
-        self.is_connected = True
-        logger.info(f"Gateway live for strategy: {self.config.strategy_id}. Monitoring order books...")
+    async def run_live_gateway(self):
+        """Connects to exchange FIX gateway and starts the asynchronous telemetry/execution loop."""
+        await self.fix_client.connect()
         
-        # Simulate an asynchronous fill event triggered by an interconnector shock
-        await asyncio.sleep(0.5)
-        await self.handle_partial_fill(
-            leg_id="LEG_SPOT_BUY", 
-            executed_vol=self.config.emergency_slice_size_mw, 
-            execution_price=66.25
+        if not self.fix_client.is_connected:
+            logger.error("Failed to establish live FIX session. Shutting down gateway.")
+            return
+
+        self.is_connected = True
+        logger.info(f"Gateway live for strategy: {self.config.strategy_id}. Monitoring FIX session...")
+
+        # Spawn background task to continuously listen for incoming Execution Reports (MsgType = 8)
+        listener_task = asyncio.create_task(
+            self.fix_client.listen_loop(on_fill_callback=self.handle_exchange_fill)
         )
+
+        try:
+            # Simulate an asynchronous trigger event (e.g., sudden interconnector trip / 1GW supply swing)
+            await asyncio.sleep(1.0)
+            logger.warning("Market Dislocation Triggered: Interconnector trip detected. Initiating primary leg execution...")
+            
+            primary_leg = self.config.legs[0]
+            await self.fix_client.send_order(
+                symbol=primary_leg.contract,
+                side="BUY",
+                qty=float(self.config.emergency_slice_size_mw),
+                price=primary_leg.limit_price
+            )
+
+            # Keep event loop alive to capture inbound fill confirmations
+            await asyncio.sleep(5.0)
+
+        finally:
+            listener_task.cancel()
+            await self.fix_client.close()
+            logger.info("Gateway session terminated safely.")
 
 if __name__ == "__main__":
     gateway = InstitutionalExecutionGateway("config.json")
-    asyncio.run(gateway.run_simulation())
+    asyncio.run(gateway.run_live_gateway())
