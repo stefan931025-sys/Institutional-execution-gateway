@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Callable
 
 logger = logging.getLogger("FIXHandler")
 
@@ -83,8 +83,8 @@ class AsyncFIXHandler:
             await self.writer.drain()
             logger.info(f"FIX NewOrderSingle dispatched [Symbol: {symbol}, Side: {side}, Qty: {qty}, Price: {price}]")
 
-    async def listen_loop(self):
-        """Asynchronously parses incoming byte stream and handles session messages."""
+    async def listen_loop(self, on_fill_callback: Callable[[str, float, float], Any]):
+        """Asynchronously parses incoming byte stream and intercepts Execution Reports (MsgType=8)."""
         buffer = b""
         while self.is_connected:
             try:
@@ -95,11 +95,33 @@ class AsyncFIXHandler:
                 buffer += data
                 
                 while b"\x01" in buffer:
-                    # Basic frame extraction based on SOH delimiter
                     parts = buffer.split(b"\x01")
-                    # Advance buffer past parsed segment
-                    buffer = b"".join([p + b"\x01" for p in parts[1:]])
+                    raw_msg = b"\x01".join(parts[:len(parts)-1]) + b"\x01"
+                    buffer = parts[-1] + b"\x01" # Keep remainder
                     
+                    # Parse Key-Value pairs from raw message
+                    fields = {}
+                    for item in raw_msg.split(b"\x01"):
+                        if b"=" in item:
+                            k, v = item.split(b"=", 1)
+                            try:
+                                fields[int(k)] = v.decode('ascii')
+                            except ValueError:
+                                continue
+                                
+                    # Check if message is an Execution Report (Tag 35 = 8)
+                    if fields.get(35) == '8':
+                        exec_type = fields.get(150) # Tag 150: ExecType (0=New, 1=Partial, 2=Fill, etc.)
+                        cl_ord_id = fields.get(11)  # Tag 11: Client Order ID
+                        cum_qty = float(fields.get(14, 0.0)) # Tag 14: CumQty
+                        avg_px = float(fields.get(6, 0.0))   # Tag 6: AvgPx
+                        
+                        logger.info(f"FIX Execution Report [ClOrdID: {cl_ord_id}, ExecType: {exec_type}, CumQty: {cum_qty}, AvgPx: {avg_px}]")
+                        
+                        # Trigger asynchronous callback if order is filled
+                        if exec_type in ('1', '2'): # Partial or Full Fill
+                            await on_fill_callback(cl_ord_id, cum_qty, avg_px)
+                            
             except asyncio.CancelledError:
                 break
             except Exception as e:
