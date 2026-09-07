@@ -18,12 +18,12 @@ class FIXHandler:
         self.sender_comp_id = sender_comp_id
         self.target_comp_id = target_comp_id
         self.state_file = state_file
-        
+
         # Session State
         self.out_seq_num = 1
         self.in_seq_num = 1
-        self.heartbeat_interval = 30  # Default seconds
-        
+        self.heartbeat_interval = 30 # Default seconds
+
         self.reader = None
         self.writer = None
         self.is_connected = False
@@ -67,9 +67,9 @@ class FIXHandler:
         body_parts = []
         for tag, val in fields.items():
             body_parts.append(f"{tag}={val}")
-        
+
         body = "\x01".join(body_parts) + "\x01"
-        
+
         # Standard Header elements
         now_utc = datetime.now(timezone.utc).strftime("%Y%m%d-%H:%M:%S.%f")[:-3]
         header_base = (
@@ -81,15 +81,15 @@ class FIXHandler:
             f"34={self.out_seq_num}\x01"
             f"52={now_utc}\x01"
         )
-        
+
         raw_msg_without_trailer = header_base + body
         checksum_str = self._calculate_checksum(raw_msg_without_trailer)
         full_message = raw_msg_without_trailer + f"10={checksum_str}\x01"
-        
+
         # Increment outbound sequence number and persist state
         self.out_seq_num += 1
         self._save_state()
-        
+
         return full_message.encode("ascii")
 
     async def send_message(self, msg_type: str, fields: dict):
@@ -97,25 +97,28 @@ class FIXHandler:
         if not self.writer or not self.is_connected:
             logger.error("Cannot send message: Socket is not connected.")
             return
-        
+
         payload = self.build_message(msg_type, fields)
         self.writer.write(payload)
         await self.writer.drain()
-        logger.debug(f"Sent FIX [MsgType={msg_type}]: {payload.decode('ascii', errors='replace').replace('\x01', '|')}")
+        
+        # Fixed for Python 3.10 compatibility
+        formatted_payload = payload.decode('ascii', errors='replace').replace('\x01', '|')
+        logger.debug(f"Sent FIX [MsgType={msg_type}]: {formatted_payload}")
 
     async def send_heartbeat(self, test_req_id: str = None):
         """Transmit a FIX Heartbeat message (MsgType=0)."""
         fields = {}
         if test_req_id:
-            fields["112"] = test_req_id  # TestReqID response mapping
+            fields["112"] = test_req_id # TestReqID response mapping
         await self.send_message("0", fields)
         logger.info("Heartbeat sent successfully.")
 
     async def send_resend_request(self, begin_seq: int, end_seq: int = 0):
         """Dispatches a formal FIX ResendRequest (MsgType = 2) to recover dropped messages."""
         fields = {
-            "7": str(begin_seq),  # BeginSeqNo
-            "16": str(end_seq)    # EndSeqNo (0 denotes infinity / up to latest)
+            "7": str(begin_seq), # BeginSeqNo
+            "16": str(end_seq) # EndSeqNo (0 denotes infinity / up to latest)
         }
         await self.send_message("2", fields)
         logger.warning(f"Dispatched FIX ResendRequest for sequence range [{begin_seq} - {end_seq if end_seq > 0 else 'END'}]")
@@ -145,14 +148,14 @@ class FIXHandler:
         msg_seq_num = int(fields.get(34, 0))
         msg_type = fields.get(35)
 
-        logger.debug(f"Received FIX [MsgType={msg_type}, Seq={msg_seq_num}]")
+        logger.debug(f"Received FIX [MsgType={msg_type}], Seq={msg_seq_num}")
 
         # Sequence Gap Validation & Automated Recovery
         if msg_seq_num > self.in_seq_num:
             logger.warning(f"Sequence gap detected! Expected {self.in_seq_num}, received {msg_seq_num}.")
             # Automatically trigger formal FIX ResendRequest for the missing block
-            await self.send_resend_request(begin_seq=self.in_seq_num, end_seq=msg_seq_num - 1)
-        elif msg_seq_num < self.in_seq_num and msg_type != "4":  # Allow SequenceReset (MsgType=4) if applicable
+            await self.send_resend_request(self.in_seq_num, msg_seq_num - 1)
+        elif msg_seq_num < self.in_seq_num and msg_type != "4": # Allow SequenceReset (MsgType=4) if applicable
             logger.error(f"Low sequence number detected (Duplicate/Reset risk). Expected >= {self.in_seq_num}, got {msg_seq_num}.")
             return
 
@@ -161,20 +164,20 @@ class FIXHandler:
         self._save_state()
 
         # Handle Protocol-Level Messages
-        if msg_type == "0":  # Heartbeat
+        if msg_type == "0": # Heartbeat
             logger.info("Received Heartbeat from counterparty.")
-        elif msg_type == "1":  # Test Request
+        elif msg_type == "1": # Test Request
             test_req_id = fields.get(112)
             logger.info(f"Received TestRequest with TestReqID={test_req_id}. Responding with Heartbeat.")
-            await self.send_heartbeat(test_req_id=test_req_id)
-        elif msg_type == "2":  # Resend Request
+            await self.send_heartbeat(test_req_id)
+        elif msg_type == "2": # Resend Request
             logger.info("Received ResendRequest from counterparty.")
-        elif msg_type == "A":  # Logon
+        elif msg_type == "A": # Logon
             logger.info("Logon successful confirmed by counterparty.")
-        elif msg_type == "5":  # Logout
+        elif msg_type == "5": # Logout
             logger.info("Logout message received from counterparty.")
             self.is_connected = False
-        elif msg_type == "8":  # Execution Report
+        elif msg_type == "8": # Execution Report
             logger.info(f"Execution Report processed for ClOrdID: {fields.get(11)}")
 
     async def connect(self):
@@ -187,8 +190,8 @@ class FIXHandler:
 
             # Send Logon message (MsgType=A)
             logon_fields = {
-                "98": "0",  # EncryptMethod (0 = None)
-                "108": str(self.heartbeat_interval)  # HeartBtInt
+                "98": "0", # EncryptMethod (0 = None)
+                "108": str(self.heartbeat_interval) # HeartBtInt
             }
             await self.send_message("A", logon_fields)
 
@@ -201,13 +204,12 @@ class FIXHandler:
                     if not data:
                         logger.warning("Connection closed by remote host.")
                         break
-                    
+
                     raw_str = data.decode("ascii", errors="ignore")
                     messages = raw_str.split("10=")
                     for msg in messages[:-1]:
                         full_msg = msg + "10=" + messages[messages.index(msg) + 1][:3] + "\x01"
                         await self.handle_incoming_message(full_msg)
-
             finally:
                 hb_task.cancel()
                 await hb_task
@@ -228,4 +230,4 @@ if __name__ == "__main__":
         sender_comp_id="CLIENT_SIM",
         target_comp_id="EXCHANGE_SIM"
     )
-    # asyncio.run(handler.connect())
+    asyncio.run(handler.connect())
