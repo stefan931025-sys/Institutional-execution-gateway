@@ -1,12 +1,17 @@
 import asyncio
 import json
-import logging
 import os
-from typing import Dict, Any, Callable
+import logging
+import time
+from datetime import datetime, timezone
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 logger = logging.getLogger("FIXHandler")
 
-class AsyncFIXHandler:
+class FIXHandler:
     def __init__(self, host: str, port: int, sender_comp_id: str, target_comp_id: str, state_file: str = "fix_state.json"):
         self.host = host
         self.port = port
@@ -14,194 +19,201 @@ class AsyncFIXHandler:
         self.target_comp_id = target_comp_id
         self.state_file = state_file
         
-        # Load persisted sequence numbers or initialize to 1
-        self.inbound_seq_num, self.outbound_seq_num = self._load_session_state()
+        # Session State
+        self.out_seq_num = 1
+        self.in_seq_num = 1
+        self.heartbeat_interval = 30  # Default seconds
         
         self.reader = None
         self.writer = None
         self.is_connected = False
-        self.heartbeat_interval = 30  # Default 30 seconds
-        self.heartbeat_task = None
+        self._load_state()
 
-    def _load_session_state(self) -> tuple[int, int]:
-        """Persists and recovers sequence numbers to prevent exchange session rejections on restart."""
+    def _load_state(self):
+        """Load persisted sequence numbers from disk to prevent session violations on restart."""
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, "r") as f:
                     data = json.load(f)
-                    logger.info(f"Loaded session state: InboundSeq={data.get('inbound', 1)}, OutboundSeq={data.get('outbound', 1)}")
-                    return data.get("inbound", 1), data.get("outbound", 1)
+                    self.out_seq_num = data.get("out_seq_num", 1)
+                    self.in_seq_num = data.get("in_seq_num", 1)
+                    logger.info(f"Loaded session state from {self.state_file}: OutSeq={self.out_seq_num}, InSeq={self.in_seq_num}")
             except Exception as e:
-                logger.warning(f"Failed to load state file, resetting sequences to 1: {e}")
-        return 1, 1
+                logger.error(f"Failed to load state file, starting fresh: {e}")
+        else:
+            logger.info("No existing state file found. Initializing sequence numbers at 1.")
+            self._save_state()
 
-    def _save_session_state(self):
-        """Saves current sequence numbers to disk."""
+    def _save_state(self):
+        """Persist current session sequence numbers to disk."""
         try:
             data = {
-                "inbound": self.inbound_seq_num,
-                "outbound": self.outbound_seq_num
+                "out_seq_num": self.out_seq_num,
+                "in_seq_num": self.in_seq_num,
+                "last_updated": datetime.now(timezone.utc).isoformat()
             }
             with open(self.state_file, "w") as f:
-                json.dump(data, f)
+                json.dump(data, f, indent=4)
         except Exception as e:
             logger.error(f"Failed to save session state: {e}")
 
-    async def connect(self):
-        """Establish persistent TCP connection with the exchange gateway."""
-        try:
-            self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
-            self.is_connected = True
-            logger.info(f"Connected to FIX Gateway endpoint at {self.host}:{self.port}")
-            await self._send_logon()
-            
-            # Launch active background heartbeat task once connected
-            self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        except Exception as e:
-            logger.error(f"Failed to connect to FIX endpoint: {e}")
-            self.is_connected = False
+    def _calculate_checksum(self, message: str) -> str:
+        """Calculate standard FIX checksum (sum of all bytes modulo 256, padded to 3 digits)."""
+        checksum = sum(ord(char) for char in message) % 256
+        return f"{checksum:03d}"
 
-    def _format_fix_message(self, msg_type: str, fields: Dict[int, Any]) -> bytes:
-        """Constructs a raw FIX message payload with persistent sequence numbering and checksums."""
-        body_parts = [
-            f"35={msg_type}",
-            f"49={self.sender_comp_id}",
-            f"56={self.target_comp_id}",
-            f"34={self.outbound_seq_num}"
-        ]
-        
+    def build_message(self, msg_type: str, fields: dict) -> bytes:
+        """Construct a standardized FIX message string encapsulated with SOH (\\x01) delimiters."""
+        body_parts = []
         for tag, val in fields.items():
             body_parts.append(f"{tag}={val}")
-            
+        
         body = "\x01".join(body_parts) + "\x01"
-        header = f"8=FIX.4.2\x019={len(body)}\x01"
-        raw_msg = header + body
         
-        checksum = sum(raw_msg.encode('ascii')) % 256
-        full_message = f"{raw_msg}10={checksum:03d}\x01"
+        # Standard Header elements
+        now_utc = datetime.now(timezone.utc).strftime("%Y%m%d-%H:%M:%S.%f")[:-3]
+        header_base = (
+            f"8=FIX.4.2\x01"
+            f"9={len(body)}\x01"
+            f"35={msg_type}\x01"
+            f"49={self.sender_comp_id}\x01"
+            f"56={self.target_comp_id}\x01"
+            f"34={self.out_seq_num}\x01"
+            f"52={now_utc}\x01"
+        )
         
-        # Increment and persist outbound sequence number
-        self.outbound_seq_num += 1
-        self._save_session_state()
+        raw_msg_without_trailer = header_base + body
+        checksum_str = self._calculate_checksum(raw_msg_without_trailer)
+        full_message = raw_msg_without_trailer + f"10={checksum_str}\x01"
         
-        return full_message.encode('ascii')
+        # Increment outbound sequence number and persist state
+        self.out_seq_num += 1
+        self._save_state()
+        
+        return full_message.encode("ascii")
 
-    async def _send_logon(self):
-        """Dispatches the mandatory FIX Logon sequence (MsgType = A)."""
-        logon_fields = {
-            98: 0,                   # EncryptMethod: None
-            108: self.heartbeat_interval  # HeartBtInt: heartbeat frequency
-        }
-        msg = self._format_fix_message("A", logon_fields)
-        self.writer.write(msg)
+    async def send_message(self, msg_type: str, fields: dict):
+        """Send a raw framed FIX message over the TCP socket."""
+        if not self.writer or not self.is_connected:
+            logger.error("Cannot send message: Socket is not connected.")
+            return
+        
+        payload = self.build_message(msg_type, fields)
+        self.writer.write(payload)
         await self.writer.drain()
-        logger.info("Sent FIX Logon sequence with active session state tracking.")
+        logger.debug(f"Sent FIX [MsgType={msg_type}]: {payload.decode('ascii', errors='replace').replace('\x01', '|')}")
+
+    async def send_heartbeat(self, test_req_id: str = None):
+        """Transmit a FIX Heartbeat message (MsgType=0)."""
+        fields = {}
+        if test_req_id:
+            fields["112"] = test_req_id  # TestReqID response mapping
+        await self.send_message("0", fields)
+        logger.info("Heartbeat sent successfully.")
 
     async def _heartbeat_loop(self):
-        """Active background loop ensuring socket stays alive during idle periods (MsgType = 0)."""
+        """Background coroutine maintaining regular heartbeat checks."""
         try:
             while self.is_connected:
                 await asyncio.sleep(self.heartbeat_interval)
-                if self.is_connected and self.writer:
-                    hb_msg = self._format_fix_message("0", {})
-                    self.writer.write(hb_msg)
-                    await self.writer.drain()
-                    logger.debug("Dispatched periodic FIX Heartbeat (MsgType=0).")
+                await self.send_heartbeat()
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            logger.error(f"Error in heartbeat loop: {e}")
 
-    async def send_order(self, symbol: str, side: str, qty: float, price: float):
-        """Translates an internal hedge trigger into a FIX New Order - Single (MsgType = D)."""
-        side_code = '1' if side.upper() == 'BUY' else '2'
-        
-        order_fields = {
-            11: f"CLORD-{int(asyncio.get_event_loop().time() * 1000)}", 
-            55: symbol,                                                 
-            54: side_code,                                              
-            38: qty,                                                    
-            40: '2',                                                    
-            44: price,                                                  
-            59: '0'                                                     
-        }
-        
-        msg = self._format_fix_message("D", order_fields)
-        if self.writer and self.is_connected:
-            self.writer.write(msg)
-            await self.writer.drain()
-            logger.info(f"FIX NewOrderSingle dispatched [Symbol: {symbol}, Side: {side}, Qty: {qty}, Price: {price}]")
+    def parse_message(self, raw_data: str) -> dict:
+        """Parse raw SOH-delimited FIX string into a tag-value dictionary."""
+        fields = {}
+        pairs = raw_data.split("\x01")
+        for pair in pairs:
+            if "=" in pair:
+                tag, val = pair.split("=", 1)
+                fields[int(tag)] = val
+        return fields
 
-    async def listen_loop(self, on_fill_callback: Callable[[str, float, float], Any]):
-        """Asynchronously parses incoming byte stream, validates sequence gaps, and routes execution reports."""
-        buffer = b""
-        while self.is_connected:
+    async def handle_incoming_message(self, raw_message: str):
+        """Process inbound messages, validate sequence numbers, and manage session-level triggers."""
+        fields = self.parse_message(raw_message)
+        msg_seq_num = int(fields.get(34, 0))
+        msg_type = fields.get(35)
+
+        logger.debug(f"Received FIX [MsgType={msg_type}, Seq={msg_seq_num}]")
+
+        # Sequence Gap Validation
+        if msg_seq_num > self.in_seq_num:
+            logger.warning(f"Sequence gap detected! Expected {self.in_seq_num}, but received {msg_seq_num}.")
+            # Production protocols would trigger a ResendRequest (Tag 35=2) here.
+        elif msg_seq_num < self.in_seq_num:
+            logger.error(f"Low sequence number detected (Duplicate/Reset risk). Expected >= {self.in_seq_num}, got {msg_seq_num}.")
+            return
+
+        # Advance inbound sequence expectation
+        self.in_seq_num = msg_seq_num + 1
+        self._save_state()
+
+        # Handle Protocol-Level Messages
+        if msg_type == "0":  # Heartbeat
+            logger.info("Received Heartbeat from counterparty.")
+        elif msg_type == "1":  # Test Request
+            test_req_id = fields.get(112)
+            logger.info(f"Received TestRequest with TestReqID={test_req_id}. Responding with Heartbeat.")
+            await self.send_heartbeat(test_req_id=test_req_id)
+        elif msg_type == "A":  # Logon
+            logger.info("Logon successful confirmed by counterparty.")
+        elif msg_type == "5":  # Logout
+            logger.info("Logout message received from counterparty.")
+            self.is_connected = False
+
+    async def connect(self):
+        """Establish asynchronous TCP socket connection and initiate session lifecycle."""
+        logger.info(f"Connecting to FIX engine at {self.host}:{self.port}...")
+        try:
+            self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+            self.is_connected = True
+            logger.info("TCP Connection established.")
+
+            # Send Logon message (MsgType=A)
+            logon_fields = {
+                "98": "0",  # EncryptMethod (0 = None)
+                "108": str(self.heartbeat_interval)  # HeartBtInt
+            }
+            await self.send_message("A", logon_fields)
+
+            # Start background heartbeat loop
+            hb_task = asyncio.create_task(self._heartbeat_loop())
+
             try:
-                data = await self.reader.read(4096)
-                if not data:
-                    logger.warning("Connection closed by exchange FIX gateway.")
-                    break
-                buffer += data
-                
-                while b"\x01" in buffer:
-                    parts = buffer.split(b"\x01")
-                    raw_msg = b"\x01".join(parts[:len(parts)-1]) + b"\x01"
-                    buffer = parts[-1] + b"\x01" 
+                while self.is_connected:
+                    data = await self.reader.read(4096)
+                    if not data:
+                        logger.warning("Connection closed by remote host.")
+                        break
                     
-                    fields = {}
-                    for item in raw_msg.split(b"\x01"):
-                        if b"=" in item:
-                            k, v = item.split(b"=", 1)
-                            try:
-                                fields[int(k)] = v.decode('ascii')
-                            except ValueError:
-                                continue
-                                
-                    if not fields:
-                        continue
+                    raw_str = data.decode("ascii", errors="ignore")
+                    # Handle potential multi-message chunks split by SOH
+                    messages = raw_str.split("10=")
+                    for msg in messages[:-1]:
+                        full_msg = msg + "10=" + messages[messages.index(msg) + 1][:3] + "\x01"
+                        await self.handle_incoming_message(full_msg)
 
-                    # Validate sequence numbers (Tag 34)
-                    msg_seq_num = int(fields.get(34, self.inbound_seq_num))
-                    if msg_seq_num > self.inbound_seq_num:
-                        logger.warning(f"Sequence gap detected! Expected {self.inbound_seq_num}, received {msg_seq_num}.")
-                        # Production systems would fire a ResendRequest (Tag 35=2) here.
-                    
-                    self.inbound_seq_num = msg_seq_num + 1
-                    self._save_session_state()
+            finally:
+                hb_task.cancel()
+                await hb_task
 
-                    msg_type = fields.get(35)
-                    
-                    # Handle incoming Heartbeats or Test Requests automatically
-                    if msg_type == '1':  # TestRequest
-                        test_req_id = fields.get(112, "")
-                        resp_msg = self._format_fix_message("0", {112: test_req_id})
-                        self.writer.write(resp_msg)
-                        await self.writer.drain()
-                    
-                    # Handle Execution Reports (MsgType = 8)
-                    elif msg_type == '8':
-                        exec_type = fields.get(150) 
-                        cl_ord_id = fields.get(11)  
-                        cum_qty = float(fields.get(14, 0.0)) 
-                        avg_px = float(fields.get(6, 0.0))   
-                        
-                        logger.info(f"FIX Execution Report [ClOrdID: {cl_ord_id}, ExecType: {exec_type}, CumQty: {cum_qty}, AvgPx: {avg_px}]")
-                        
-                        if exec_type in ('1', '2'): 
-                            await on_fill_callback(cl_ord_id, cum_qty, avg_px)
-                            
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error encountered in FIX listen loop: {e}")
-                break
+        except Exception as e:
+            logger.error(f"Socket connection error: {e}")
+        finally:
+            self.is_connected = False
+            if self.writer:
+                self.writer.close()
+                await self.writer.wait_closed()
+            logger.info("Connection terminated and resources cleaned up.")
 
-    async def close(self):
-        """Closes the background tasks and network connection cleanly."""
-        self.is_connected = False
-        if self.heartbeat_task:
-            self.heartbeat_task.cancel()
-        if self.writer:
-            self.writer.close()
-            await self.writer.wait_closed()
-            logger.info("FIX session terminated gracefully and state persisted.")
+if __name__ == "__main__":
+    # Test runner hook for local validation
+    handler = FIXHandler(
+        host="127.0.0.1",
+        port=9800,
+        sender_comp_id="CLIENT_SIM",
+        target_comp_id="EXCHANGE_SIM"
+    )
+    # asyncio.run(handler.connect())
