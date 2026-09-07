@@ -63,7 +63,7 @@ class FIXHandler:
         return f"{checksum:03d}"
 
     def build_message(self, msg_type: str, fields: dict) -> bytes:
-        """Construct a standardized FIX message string encapsulated with SOH (\\x01) delimiters."""
+        """Construct a standardized FIX message string encapsulated with SOH (\x01) delimiters."""
         body_parts = []
         for tag, val in fields.items():
             body_parts.append(f"{tag}={val}")
@@ -111,6 +111,15 @@ class FIXHandler:
         await self.send_message("0", fields)
         logger.info("Heartbeat sent successfully.")
 
+    async def send_resend_request(self, begin_seq: int, end_seq: int = 0):
+        """Dispatches a formal FIX ResendRequest (MsgType = 2) to recover dropped messages."""
+        fields = {
+            "7": str(begin_seq),  # BeginSeqNo
+            "16": str(end_seq)    # EndSeqNo (0 denotes infinity / up to latest)
+        }
+        await self.send_message("2", fields)
+        logger.warning(f"Dispatched FIX ResendRequest for sequence range [{begin_seq} - {end_seq if end_seq > 0 else 'END'}]")
+
     async def _heartbeat_loop(self):
         """Background coroutine maintaining regular heartbeat checks."""
         try:
@@ -131,18 +140,19 @@ class FIXHandler:
         return fields
 
     async def handle_incoming_message(self, raw_message: str):
-        """Process inbound messages, validate sequence numbers, and manage session-level triggers."""
+        """Process inbound messages, validate sequence numbers, and handle gaps via ResendRequest."""
         fields = self.parse_message(raw_message)
         msg_seq_num = int(fields.get(34, 0))
         msg_type = fields.get(35)
 
         logger.debug(f"Received FIX [MsgType={msg_type}, Seq={msg_seq_num}]")
 
-        # Sequence Gap Validation
+        # Sequence Gap Validation & Automated Recovery
         if msg_seq_num > self.in_seq_num:
-            logger.warning(f"Sequence gap detected! Expected {self.in_seq_num}, but received {msg_seq_num}.")
-            # Production protocols would trigger a ResendRequest (Tag 35=2) here.
-        elif msg_seq_num < self.in_seq_num:
+            logger.warning(f"Sequence gap detected! Expected {self.in_seq_num}, received {msg_seq_num}.")
+            # Automatically trigger formal FIX ResendRequest for the missing block
+            await self.send_resend_request(begin_seq=self.in_seq_num, end_seq=msg_seq_num - 1)
+        elif msg_seq_num < self.in_seq_num and msg_type != "4":  # Allow SequenceReset (MsgType=4) if applicable
             logger.error(f"Low sequence number detected (Duplicate/Reset risk). Expected >= {self.in_seq_num}, got {msg_seq_num}.")
             return
 
@@ -157,11 +167,15 @@ class FIXHandler:
             test_req_id = fields.get(112)
             logger.info(f"Received TestRequest with TestReqID={test_req_id}. Responding with Heartbeat.")
             await self.send_heartbeat(test_req_id=test_req_id)
+        elif msg_type == "2":  # Resend Request
+            logger.info("Received ResendRequest from counterparty.")
         elif msg_type == "A":  # Logon
             logger.info("Logon successful confirmed by counterparty.")
         elif msg_type == "5":  # Logout
             logger.info("Logout message received from counterparty.")
             self.is_connected = False
+        elif msg_type == "8":  # Execution Report
+            logger.info(f"Execution Report processed for ClOrdID: {fields.get(11)}")
 
     async def connect(self):
         """Establish asynchronous TCP socket connection and initiate session lifecycle."""
@@ -189,7 +203,6 @@ class FIXHandler:
                         break
                     
                     raw_str = data.decode("ascii", errors="ignore")
-                    # Handle potential multi-message chunks split by SOH
                     messages = raw_str.split("10=")
                     for msg in messages[:-1]:
                         full_msg = msg + "10=" + messages[messages.index(msg) + 1][:3] + "\x01"
@@ -209,7 +222,6 @@ class FIXHandler:
             logger.info("Connection terminated and resources cleaned up.")
 
 if __name__ == "__main__":
-    # Test runner hook for local validation
     handler = FIXHandler(
         host="127.0.0.1",
         port=9800,
