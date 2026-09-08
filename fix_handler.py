@@ -24,8 +24,11 @@ class FIXHandler:
         self.in_seq_num = 1
         self.heartbeat_interval = 30
         
-        # Outbound message store for ResendRequests (SeqNum -> Raw Message Bytes)
+        # Outbound message store for ResendRequests
         self.outbound_store = {}
+
+        # Order State Machine Store (ClOrdID -> Order Details Dictionary)
+        self.orders = {}
 
         self.reader = None
         self.writer = None
@@ -59,18 +62,15 @@ class FIXHandler:
             logger.error(f"Failed to save session state: {e}")
 
     def _load_outbound_store(self):
-        """Load historical outbound messages from disk for exchange resend requests."""
         if os.path.exists(self.store_file):
             try:
                 with open(self.store_file, "r") as f:
-                    # Keys stored as strings in JSON need conversion back to ints
                     raw_store = json.load(f)
                     self.outbound_store = {int(k): v.encode("ascii") for k, v in raw_store.items()}
             except Exception as e:
                 logger.error(f"Failed to load outbound message store: {e}")
 
     def _save_outbound_store(self):
-        """Persist outbound messages to disk for audit trails and crash recovery."""
         try:
             raw_store = {str(k): v.decode("ascii", errors="ignore") for k, v in self.outbound_store.items()}
             with open(self.store_file, "w") as f:
@@ -83,7 +83,6 @@ class FIXHandler:
         return f"{checksum:03d}"
 
     def build_message(self, msg_type: str, fields: dict, override_seq_num: int = None) -> bytes:
-        """Constructs a FIX message, supporting sequence number overrides for administrative resends."""
         seq_num = override_seq_num if override_seq_num is not None else self.out_seq_num
         
         body_parts = []
@@ -108,7 +107,6 @@ class FIXHandler:
         full_message = raw_msg_without_trailer + f"10={checksum_str}\x01"
         payload = full_message.encode("ascii")
 
-        # Only archive business/standard messages under their true runtime sequence number
         if override_seq_num is None:
             self.outbound_store[self.out_seq_num] = payload
             self._save_outbound_store()
@@ -118,7 +116,6 @@ class FIXHandler:
         return payload
 
     async def send_raw_payload(self, payload: bytes):
-        """Writes raw bytes directly to the socket (used during message replays)."""
         if not self.writer or not self.is_connected:
             return
         self.writer.write(payload)
@@ -129,53 +126,79 @@ class FIXHandler:
             return
         payload = self.build_message(msg_type, fields)
         await self.send_raw_payload(payload)
-        formatted_payload = payload.decode('ascii', errors='replace').replace('\x01', '|')
-        logger.debug(f"Sent FIX [MsgType={msg_type}]: {formatted_payload}")
 
-    async def handle_resend_request(self, begin_seq: int, end_seq: int):
-        """Replays historical messages or issues a SequenceReset(GapFill) for sensitive payloads."""
-        logger.warning(f"Processing ResendRequest from counterparty for range: {begin_seq} to {end_seq}")
-        max_seq = end_seq if end_seq > 0 else max(self.outbound_store.keys(), default=self.out_seq_num - 1)
-
-        for seq in range(begin_seq, max_seq + 1):
-            if seq in self.outbound_store:
-                msg_bytes = self.outbound_store[seq]
-                # In strict FIX compliance, replayed application messages should ideally 
-                # be flagged with PossDupFlag(43)=Y, but basic replays can be streamed directly:
-                await self.send_raw_payload(msg_bytes)
-                logger.info(f"Replayed historical outbound message Seq={seq}")
-            else:
-                # If a message doesn't exist (e.g. administrative gaps), send a SequenceReset - GapFill
-                logger.warning(f"Missing message at Seq={seq}. Sending SequenceReset GapFill.")
-                await self.send_sequence_reset_gap_fill(seq, seq + 1)
-
-    async def send_sequence_reset_gap_fill(self, new_seq_no: int, msg_seq_num: int):
-        """Sends a SequenceReset (MsgType=4) with GapFillFlag=Y to bypass un-reprintable administrative gaps."""
+    async def send_order(self, cl_ord_id: str, symbol: str, side: str, order_qty: float, price: float, ord_type: str = "2"):
+        """Submits a New Order Single (MsgType=D) and initializes local order state tracking."""
         fields = {
-            "36": str(new_seq_no), # NewSeqNo
-            "123": "Y"             # GapFillFlag = Yes
+            "11": cl_ord_id,     # ClOrdID
+            "54": side,          # Side (1=Buy, 2=Sell)
+            "55": symbol,        # Symbol
+            "38": str(order_qty),# OrderQty
+            "40": ord_type,      # OrdType (1=Market, 2=Limit)
+            "44": str(price)     # Price
         }
-        # Sequence reset bypasses standard sequential tracking and uses explicit sequence mapping
-        payload = self.build_message("4", fields, override_seq_num=msg_seq_num)
-        await self.send_raw_payload(payload)
+        
+        # Track initial state as Pending New
+        self.orders[cl_ord_id] = {
+            "cl_ord_id": cl_ord_id,
+            "symbol": symbol,
+            "side": side,
+            "order_qty": order_qty,
+            "price": price,
+            "status": "PENDING_NEW",
+            "cum_qty": 0.0,
+            "leaves_qty": order_qty,
+            "order_id": None,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        await self.send_message("D", fields)
+        logger.info(f"Sent NewOrderSingle [ClOrdID={cl_ord_id}, Symbol={symbol}, Side={side}, Qty={order_qty}, Price={price}]")
+
+    def handle_execution_report(self, fields: dict):
+        """Processes incoming Execution Reports (MsgType=8) and updates internal order state machine."""
+        cl_ord_id = fields.get(11)
+        order_id = fields.get(37)
+        ord_status = fields.get(39) # 0=New, 1=PartiallyFilled, 2=Filled, 4=Canceled, 8=Rejected
+        exec_type = fields.get(150)
+        cum_qty = float(fields.get(14, 0.0))
+        leaves_qty = float(fields.get(151, 0.0))
+
+        status_mapping = {
+            "0": "NEW",
+            "1": "PARTIALLY_FILLED",
+            "2": "FILLED",
+            "4": "CANCELED",
+            "8": "REJECTED"
+        }
+
+        if cl_ord_id in self.orders:
+            order = self.orders[cl_ord_id]
+            order["order_id"] = order_id
+            order["status"] = status_mapping.get(ord_status, f"UNKNOWN_{ord_status}")
+            order["cum_qty"] = cum_qty
+            order["leaves_qty"] = leaves_qty
+            order["updated_at"] = datetime.now(timezone.utc).isoformat()
+            logger.info(f"Order state updated: ClOrdID={cl_ord_id} Status={order['status']} CumQty={cum_qty} Leaves={leaves_qty}")
+        else:
+            logger.warning(f"Received ExecutionReport for untracked ClOrdID={cl_ord_id}")
 
     async def handle_incoming_message(self, raw_message: str):
         fields = self.parse_message(raw_message)
         msg_seq_num = int(fields.get(34, 0))
         msg_type = fields.get(35)
 
-        # Sequence Gap Validation & Automated Recovery
         if msg_seq_num > self.in_seq_num:
             logger.warning(f"Sequence gap detected! Expected {self.in_seq_num}, received {msg_seq_num}.")
             await self.send_message("2", {"7": str(self.in_seq_num), "16": str(msg_seq_num - 1)})
         
-        # Advance inbound sequence expectation
         if msg_seq_num >= self.in_seq_num:
             self.in_seq_num = msg_seq_num + 1
             self._save_state()
 
-        # Handle Protocol-Level Messages including Resend Requests from Exchange
-        if msg_type == "2": # ResendRequest
+        if msg_type == "8": # Execution Report
+            self.handle_execution_report(fields)
+        elif msg_type == "2": # ResendRequest
             begin_seq = int(fields.get(7, 0))
             end_seq = int(fields.get(16, 0))
             await self.handle_resend_request(begin_seq, end_seq)
@@ -188,6 +211,19 @@ class FIXHandler:
         elif msg_type == "5":
             logger.info("Logout received.")
             self.is_connected = False
+
+    async def handle_resend_request(self, begin_seq: int, end_seq: int):
+        max_seq = end_seq if end_seq > 0 else max(self.outbound_store.keys(), default=self.out_seq_num - 1)
+        for seq in range(begin_seq, max_seq + 1):
+            if seq in self.outbound_store:
+                await self.send_raw_payload(self.outbound_store[seq])
+            else:
+                await self.send_sequence_reset_gap_fill(seq, seq + 1)
+
+    async def send_sequence_reset_gap_fill(self, new_seq_no: int, msg_seq_num: int):
+        fields = {"36": str(new_seq_no), "123": "Y"}
+        payload = self.build_message("4", fields, override_seq_num=msg_seq_num)
+        await self.send_raw_payload(payload)
 
     def parse_message(self, raw_data: str) -> dict:
         fields = {}
