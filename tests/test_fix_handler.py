@@ -1,4 +1,6 @@
 import pytest
+import asyncio
+import time
 from fix_handler import FIXHandler, DurableSequenceStore
 
 @pytest.fixture
@@ -28,8 +30,7 @@ def test_parse_message(fix_client):
     assert parsed[49] == "EXCHANGE_SIM"
     assert parsed[34] == "42"
 
-
-# --- NEW: Institutional Resilience & Sequence Gap Tests (Step 1 Additions) ---
+# --- Institutional Resilience & Sequence Gap Tests (Step 1 Additions) ---
 
 def test_sequence_gap_and_resend(fix_client):
     """Simulate a dropped packet sequence and verify gap-fill resend handling."""
@@ -58,3 +59,22 @@ def test_durable_persistence_reload(tmp_path):
     
     assert inbound == 42
     assert outbound == 55, "Durable state must persist across restarts."
+
+# --- NEW: Performance Profiling Test (Step 3 Addition) ---
+
+@pytest.mark.asyncio
+async def test_gateway_throughput_benchmark(fix_client):
+    """Benchmark parsing throughput to prove low-latency capabilities for hiring managers."""
+    iterations = 1000
+    start_time = time.perf_counter()
+    
+    for i in range(iterations):
+        raw_msg = f"8=FIX.4.2\x019=55\x0135=D\x0134={i}\x0149=EXCHANGE_SIM\x0156=CLIENT_SIM\x0110=123\x01"
+        fix_client.parse_message(raw_msg)
+        
+    duration = time.perf_counter() - start_time
+    msgs_per_sec = iterations / duration
+    
+    # Assert a minimum performance threshold (e.g., must clear > 5,000 msgs/sec in test runner)
+    assert msgs_per_sec > 5000, f"Throughput too low: {msgs_per_sec:.2f} msgs/sec"
+    print(f"\n[BENCHMARK] Processed {iterations} messages in {duration:.4f}s ({msgs_per_sec:,.2f} msgs/sec)")
