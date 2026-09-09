@@ -2,10 +2,15 @@
   "strategy_id": "GB-POWER-SPREAD-01",
   "max_allowable_spread": 1.50,
   "emergency_slice_size_mw": 10,
+  "environment_overrides": {
+    "enabled": true,
+    "target_comp_id_env": "FIX_TARGET_COMP_ID",
+    "port_env": "FIX_PORT"
+  },
   "legs": [
     {
       "leg_id": "LEG_SPOT_BUY",
-      "contract": "EPEX-GB-PEAK",
+      "contract": "EPIX-GB-PEAK",
       "target_volume": 10,
       "limit_price": 65.00
     },
