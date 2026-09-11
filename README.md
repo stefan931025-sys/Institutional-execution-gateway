@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository provides a lightweight, low-latency asynchronous execution and risk-hedging framework designed specifically for power and spot trading desks. It addresses critical market friction points—such as systemic shocks caused by sudden interconnector trips (e.g., 1GW supply swings) and the manual re-pricing delays that result in undefined leg-risk slippage.
+This repository provides a lightweight, low-latency asynchronous execution and risk-hedging framework designed specifically for power and spot trading desks. It addresses critical market friction points—such as systemic shocks caused by sudden interconnector trips (e.g., IGA supply swings) and the manual re-pricing delays that result in undefined leg-risk slippage.
 
 ## Core Architecture
 
@@ -15,5 +15,6 @@ This repository provides a lightweight, low-latency asynchronous execution and r
 
 1. Clone the repository and configure your desk parameters in `config.json`.
 2. Run the simulation script to test automated leg-risk mitigation:
+
 ```bash
 python gateway.py
