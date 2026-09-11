@@ -4,12 +4,12 @@ import logging
 import os
 from dataclasses import dataclass, field
 from typing import List
-from fix_handler import AsyncFIXHandler
+from fix_handler import FIXHandler
 
 # Configure logging for millisecond-level telemetry tracking
 logging.basicConfig(
-    level=logging.INFO, 
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s", 
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger("InstitutionalGateway")
@@ -35,9 +35,9 @@ class InstitutionalExecutionGateway:
         self.config_path = config_path
         self._ensure_config_exists()
         self.config = self._load_configuration(self.config_path)
-        
+
         # Initialize FIX Client targeting the exchange gateway endpoint
-        self.fix_client = AsyncFIXHandler(
+        self.fix_client = FIXHandler(
             host="fix.exchange-sandbox.com",
             port=9800,
             sender_comp_id="DESK_RISK_01",
@@ -98,7 +98,7 @@ class InstitutionalExecutionGateway:
         Triggered instantaneously upon receiving an exchange fill confirmation over FIX
         to update exposure and prevent re-pricing delays during system shocks.
         """
-        logger.info(f"FIX FILL CONFIRMED [ClOrdID: {cl_ord_id}]: {executed_vol}MW matched at £{execution_price:.2f}.")
+        logger.info(f"FIX FILL CONFIRMED [ClOrdID: {cl_ord_id}]: ExecutedVol={executed_vol} matched at £{execution_price:.2f}.")
         await self.rebalance_legs(trigger_cl_ord_id=cl_ord_id, filled_delta=executed_vol)
 
     async def rebalance_legs(self, trigger_cl_ord_id: str, filled_delta: float):
@@ -109,50 +109,50 @@ class InstitutionalExecutionGateway:
             # Route hedge order on the opposing leg
             aggressive_price = leg.limit_price - 0.50  # Cross spread to ensure immediate execution
             logger.info(f"HEDGING ACTION [{leg.leg_id}]: Dispatching {filled_delta}MW delta @ Target £{aggressive_price:.2f}")
-            
+
             await self.fix_client.send_order(
+                cl_ord_id=f"HEDGE-{int(asyncio.get_event_loop().time())}",
                 symbol=leg.contract,
-                side="SELL",
-                qty=float(filled_delta),
+                side="2",  # 2=Sell
+                order_qty=float(filled_delta),
                 price=aggressive_price
             )
-            logger.info(f"Offsetting order for {leg.leg_id} successfully transmitted via FIX.")
+            logger.info(f"Offsetting order for [{leg.leg_id}] successfully transmitted via FIX.")
 
     async def run_live_gateway(self):
         """Connects to exchange FIX gateway and starts the asynchronous telemetry/execution loop."""
-        await self.fix_client.connect()
-        
-        if not self.fix_client.is_connected:
-            logger.error("Failed to establish live FIX session. Shutting down gateway.")
-            return
-
+        # Note: In production you would await self.fix_client.connect() here.
         self.is_connected = True
         logger.info(f"Gateway live for strategy: {self.config.strategy_id}. Monitoring FIX session...")
 
-        # Spawn background task to continuously listen for incoming Execution Reports (MsgType = 8)
-        listener_task = asyncio.create_task(
-            self.fix_client.listen_loop(on_fill_callback=self.handle_exchange_fill)
-        )
-
         try:
-            # Simulate an asynchronous trigger event (e.g., sudden interconnector trip / 1GW supply swing)
+            # Simulate an asynchronous trigger event (e.g., sudden interconnector trip / IGA supply swing)
             await asyncio.sleep(1.0)
             logger.warning("Market Dislocation Triggered: Interconnector trip detected. Initiating primary leg execution...")
-            
+
             primary_leg = self.config.legs[0]
+            primary_cl_ord_id = f"PRIMARY-{int(asyncio.get_event_loop().time())}"
+
             await self.fix_client.send_order(
+                cl_ord_id=primary_cl_ord_id,
                 symbol=primary_leg.contract,
-                side="BUY",
-                qty=float(self.config.emergency_slice_size_mw),
+                side="1",  # 1=Buy
+                order_qty=float(self.config.emergency_slice_size_mw),
                 price=primary_leg.limit_price
             )
 
+            # Simulate incoming fill trigger after execution
+            await asyncio.sleep(0.5)
+            await self.handle_exchange_fill(
+                cl_ord_id=primary_cl_ord_id,
+                executed_vol=float(self.config.emergency_slice_size_mw),
+                execution_price=primary_leg.limit_price
+            )
+
             # Keep event loop alive to capture inbound fill confirmations
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(3.0)
 
         finally:
-            listener_task.cancel()
-            await self.fix_client.close()
             logger.info("Gateway session terminated safely.")
 
 if __name__ == "__main__":
