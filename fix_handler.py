@@ -23,7 +23,7 @@ class FIXHandler:
         self.out_seq_num = 1
         self.in_seq_num = 1
         self.heartbeat_interval = 30
-        
+
         # Outbound message store for ResendRequests
         self.outbound_store = {}
 
@@ -33,7 +33,7 @@ class FIXHandler:
         self.reader = None
         self.writer = None
         self.is_connected = False
-        
+
         self._load_state()
         self._load_outbound_store()
 
@@ -84,7 +84,7 @@ class FIXHandler:
 
     def build_message(self, msg_type: str, fields: dict, override_seq_num: int = None) -> bytes:
         seq_num = override_seq_num if override_seq_num is not None else self.out_seq_num
-        
+
         body_parts = []
         for tag, val in fields.items():
             body_parts.append(f"{tag}={val}")
@@ -130,14 +130,14 @@ class FIXHandler:
     async def send_order(self, cl_ord_id: str, symbol: str, side: str, order_qty: float, price: float, ord_type: str = "2"):
         """Submits a New Order Single (MsgType=D) and initializes local order state tracking."""
         fields = {
-            "11": cl_ord_id,     # ClOrdID
-            "54": side,          # Side (1=Buy, 2=Sell)
-            "55": symbol,        # Symbol
-            "38": str(order_qty),# OrderQty
-            "40": ord_type,      # OrdType (1=Market, 2=Limit)
-            "44": str(price)     # Price
+            11: cl_ord_id,
+            54: side,         # 1=Buy, 2=Sell
+            55: symbol,
+            38: str(order_qty),
+            40: ord_type,     # 1=Market, 2=Limit
+            44: str(price)
         }
-        
+
         # Track initial state as Pending New
         self.orders[cl_ord_id] = {
             "cl_ord_id": cl_ord_id,
@@ -151,7 +151,7 @@ class FIXHandler:
             "order_id": None,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
-        
+
         await self.send_message("D", fields)
         logger.info(f"Sent NewOrderSingle [ClOrdID={cl_ord_id}, Symbol={symbol}, Side={side}, Qty={order_qty}, Price={price}]")
 
@@ -159,7 +159,7 @@ class FIXHandler:
         """Processes incoming Execution Reports (MsgType=8) and updates internal order state machine."""
         cl_ord_id = fields.get(11)
         order_id = fields.get(37)
-        ord_status = fields.get(39) # 0=New, 1=PartiallyFilled, 2=Filled, 4=Canceled, 8=Rejected
+        ord_status = fields.get(39)  # 0=New, 1=PartiallyFilled, 2=Filled, 4=Canceled, 8=Rejected
         exec_type = fields.get(150)
         cum_qty = float(fields.get(14, 0.0))
         leaves_qty = float(fields.get(151, 0.0))
@@ -175,7 +175,7 @@ class FIXHandler:
         if cl_ord_id in self.orders:
             order = self.orders[cl_ord_id]
             order["order_id"] = order_id
-            order["status"] = status_mapping.get(ord_status, f"UNKNOWN_{ord_status}")
+            order["status"] = status_mapping.get(ord_status, "UNKNOWN_ORD_STATUS")
             order["cum_qty"] = cum_qty
             order["leaves_qty"] = leaves_qty
             order["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -188,17 +188,19 @@ class FIXHandler:
         msg_seq_num = int(fields.get(34, 0))
         msg_type = fields.get(35)
 
-        if msg_seq_num > self.in_seq_num:
+        if msg_seq_num == self.in_seq_num:
+            self.in_seq_num += 1
+            self._save_state()
+        elif msg_seq_num > self.in_seq_num:
             logger.warning(f"Sequence gap detected! Expected {self.in_seq_num}, received {msg_seq_num}.")
             await self.send_message("2", {"7": str(self.in_seq_num), "16": str(msg_seq_num - 1)})
-        
-        if msg_seq_num >= self.in_seq_num:
-            self.in_seq_num = msg_seq_num + 1
-            self._save_state()
+        else:
+            logger.warning(f"Duplicate or old sequence received: {msg_seq_num}. Expected: {self.in_seq_num}")
+            return
 
-        if msg_type == "8": # Execution Report
+        if msg_type == "8":
             self.handle_execution_report(fields)
-        elif msg_type == "2": # ResendRequest
+        elif msg_type == "2":  # ResendRequest
             begin_seq = int(fields.get(7, 0))
             end_seq = int(fields.get(16, 0))
             await self.handle_resend_request(begin_seq, end_seq)
@@ -220,9 +222,9 @@ class FIXHandler:
             else:
                 await self.send_sequence_reset_gap_fill(seq, seq + 1)
 
-    async def send_sequence_reset_gap_fill(self, new_seq_no: int, msg_seq_num: int):
+    async def send_sequence_reset_gap_fill(self, new_seq_no: int, rsg_seq_num: int):
         fields = {"36": str(new_seq_no), "123": "Y"}
-        payload = self.build_message("4", fields, override_seq_num=msg_seq_num)
+        payload = self.build_message("4", fields, override_seq_num=rsg_seq_num)
         await self.send_raw_payload(payload)
 
     def parse_message(self, raw_data: str) -> dict:
