@@ -11,10 +11,11 @@ This repository provides a lightweight, low-latency asynchronous execution and r
 * **Automated Multi-Leg Rebalancing:** Instantly calculates partial fills and dispatches aggressive hedging orders to offsetting legs to lock down exposure before manual intervention is required.
 * **Decoupled Configuration Layer:** Uses external JSON configuration mappings (`config.json`) allowing the engine to adapt seamlessly across disparate exchange stacks or terminal environments.
 
-## Quick Start
+## Testing & Performance Benchmarking
 
-1. Clone the repository and configure your desk parameters in `config.json`.
-2. Run the simulation script to test automated leg-risk mitigation:
+The repository includes a comprehensive unit test suite covering FIX message parsing, checksum generation, sequence gap detection, and state durability.
+
+To run the test suite locally with `pytest`:
 
 ```bash
-python gateway.py
+PYTHONPATH=. pytest tests/ -v
