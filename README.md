@@ -1,21 +1,47 @@
-# Institutional Execution Gateway & Multi-Leg Hedging Engine
+# Institutional Execution Gateway
 
-## Overview
+A production-grade, low-latency asynchronous execution gateway engineered for power and spot trading markets. Built with strict pre-trade risk controls, institutional resilience (sequence gap handling & durable state recovery), real-time Prometheus telemetry, and advanced algorithmic order slicing.
 
-This repository provides a lightweight, low-latency asynchronous execution and risk-hedging framework designed specifically for power and spot trading desks. It addresses critical market friction points—such as systemic shocks caused by sudden interconnector trips (e.g., IGA supply swings) and the manual re-pricing delays that result in undefined leg-risk slippage.
+## 🚀 Key Architectural Highlights
 
-## Core Architecture
+*   **Asynchronous Core:** Powered by Python's `asyncio` and `uvloop` for high-throughput, low-latency message processing.
+*   **FIX Protocol Engine:** Implements robust session management, checksum validation, SOH-delimited message parsing, and automated sequence gap detection/resend requests.
+*   **Pre-Trade Risk Management Engine:** Hardens execution safety with real-time gates for:
+    *   Maximum MW order size boundaries.
+    *   Notional value limits (GBP/USD).
+    *   Velocity rate-limiting (messages per second flood protection).
+    *   Instantaneous Master Kill Switch.
+*   **Institutional Resilience & State Persistence:** Features a durable JSON/disk-backed sequence store to ensure active session states survive unexpected restarts or system crashes.
+*   **Observability & Telemetry:** Integrated `prometheus-client` exporters exposing real-time order counters, risk rejection error codes, and execution latency histograms.
+*   **Advanced Execution Algorithms:** Includes an **Iceberg / TWAP Slicer** to break down large parent block orders into hidden child slices over timed intervals, minimizing market impact during liquidity shocks.
 
-* **Event-Driven Telemetry Listener:** Ingests order book updates asynchronously to bypass visual terminal lag and interface bottlenecks.
-* **Dynamic Spread & Volatility Triggers:** Automatically tracks threshold blowouts and flags market dislocations in real time.
-* **Automated Multi-Leg Rebalancing:** Instantly calculates partial fills and dispatches aggressive hedging orders to offsetting legs to lock down exposure before manual intervention is required.
-* **Decoupled Configuration Layer:** Uses external JSON configuration mappings (`config.json`) allowing the engine to adapt seamlessly across disparate exchange stacks or terminal environments.
+---
 
-## Testing & Performance Benchmarking
+## 🛠️ Tech Stack
 
-The repository includes a comprehensive unit test suite covering FIX message parsing, checksum generation, sequence gap detection, and state durability.
+*   **Language:** Python 3.10+
+*   **Networking/Concurrency:** `asyncio`, `uvloop`
+*   **Testing:** `pytest`, `pytest-asyncio`
+*   **Monitoring:** `prometheus-client` (Port `9090`)
+*   **Containerization:** Multi-stage `Dockerfile` (optimized for slim runtime images)
+*   **CI/CD:** GitHub Actions automated testing pipelines
 
-To run the test suite locally with `pytest`:
+---
 
-```bash
-PYTHONPATH=. pytest tests/ -v
+## 📁 Repository Structure
+
+```text
+Institutional-execution-gateway/
+│
+├── gateway.py              # Main asynchronous execution orchestrator & risk engine
+├── fix_handler.py          # FIX protocol handler, session logic, and durable store
+├── execution_algos.py      # Advanced execution algorithms (Iceberg/TWAP Slicer)
+├── metrics.py              # Prometheus telemetry and metrics exporters
+├── requirements.txt        # Production and testing dependencies
+├── Dockerfile              # Multi-stage production container build
+├── .github/
+│   └── workflows/
+│       └── ci.yml          # GitHub Actions automated CI test pipeline
+└── tests/
+    ├── test_fix_handler.py # Unit tests, state persistence, and performance benchmarks
+    └── test_compliance.py  # Exchange session compliance and logon verification
