@@ -2,9 +2,14 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 from fix_handler import FIXHandler
+
+# Import the new production components
+from metrics import start_metrics_server, ORDER_COUNTER, LATENCY_HISTOGRAM, RISK_REJECTIONS
+from execution_algos import IcebergSlicer
 
 # Configure logging for millisecond-level telemetry tracking
 logging.basicConfig(
@@ -13,6 +18,49 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger("InstitutionalGateway")
+
+@dataclass
+class RiskLimits:
+    max_order_size_mw: float = 50.0
+    max_notional_value: float = 500000.0  # GBP
+    max_messages_per_second: int = 5
+    kill_switch_active: bool = False
+
+class PreTradeRiskEngine:
+    def __init__(self, limits: RiskLimits):
+        self.limits = limits
+        self._message_timestamps = []
+
+    def validate_order(self, symbol: str, volume: float, price: float) -> Tuple[bool, str]:
+        """Validates outbound orders against strict institutional risk parameters."""
+        if self.limits.kill_switch_active:
+            RISK_REJECTIONS.labels(reason_code="KILL_SWITCH_ACTIVE").inc()
+            return False, "REJECTED: Master Kill Switch is actively engaged."
+
+        if volume <= 0:
+            RISK_REJECTIONS.labels(reason_code="INVALID_VOLUME").inc()
+            return False, f"REJECTED: Invalid order volume ({volume}). Must be > 0."
+        if volume > self.limits.max_order_size_mw:
+            RISK_REJECTIONS.labels(reason_code="MAX_SIZE_EXCEEDED").inc()
+            return False, f"REJECTED: Volume {volume}MW exceeds limit of {self.limits.max_order_size_mw}MW."
+
+        notional = volume * price
+        if notional > self.limits.max_notional_value:
+            RISK_REJECTIONS.labels(reason_code="MAX_NOTIONAL_EXCEEDED").inc()
+            return False, f"REJECTED: Notional £{notional:,.2f} exceeds limit of £{self.limits.max_notional_value:,.2f}."
+
+        now = time.time()
+        self._message_timestamps = [t for t in self._message_timestamps if now - t < 1.0]
+        if len(self._message_timestamps) >= self.limits.max_messages_per_second:
+            RISK_REJECTIONS.labels(reason_code="VELOCITY_RATE_LIMIT").inc()
+            return False, f"REJECTED: Velocity rate limit hit ({self.limits.max_messages_per_second} msgs/sec)."
+
+        self._message_timestamps.append(now)
+        return True, "APPROVED"
+
+    def engage_kill_switch(self):
+        self.limits.kill_switch_active = True
+        logger.critical("MASTER KILL SWITCH ENGAGED. All trading halted.")
 
 @dataclass
 class LegOrder:
@@ -36,6 +84,9 @@ class InstitutionalExecutionGateway:
         self._ensure_config_exists()
         self.config = self._load_configuration(self.config_path)
 
+        # Initialize Prometheus Metrics Server on port 9090
+        start_metrics_server(port=9090)
+
         # Initialize FIX Client targeting the exchange gateway endpoint
         self.fix_client = FIXHandler(
             host="fix.exchange-sandbox.com",
@@ -45,8 +96,16 @@ class InstitutionalExecutionGateway:
         )
         self.is_connected = False
 
+        # Initialize Pre-Trade Risk Engine bounds
+        risk_limits = RiskLimits(
+            max_order_size_mw=float(self.config.emergency_slice_size_mw * 2),
+            max_notional_value=500000.0,
+            max_messages_per_second=5
+        )
+        self.risk_engine = PreTradeRiskEngine(risk_limits)
+
     def _ensure_config_exists(self):
-        """Automatically generates a default config.json if missing so the script runs instantly."""
+        """Automatically generates a default config.json if missing."""
         if not os.path.exists(self.config_path):
             default_data = {
                 "strategy_id": "GB-POWER-SPREAD-01",
@@ -94,33 +153,46 @@ class InstitutionalExecutionGateway:
         )
 
     async def handle_exchange_fill(self, cl_ord_id: str, executed_vol: float, execution_price: float):
-        """
-        Triggered instantaneously upon receiving an exchange fill confirmation over FIX
-        to update exposure and prevent re-pricing delays during system shocks.
-        """
+        """Triggered instantaneously upon receiving an exchange fill confirmation over FIX."""
         logger.info(f"FIX FILL CONFIRMED [ClOrdID: {cl_ord_id}]: ExecutedVol={executed_vol} matched at £{execution_price:.2f}.")
+        ORDER_COUNTER.labels(status="FILLED", symbol="MULTI").inc()
         await self.rebalance_legs(trigger_cl_ord_id=cl_ord_id, filled_delta=executed_vol)
 
     async def rebalance_legs(self, trigger_cl_ord_id: str, filled_delta: float):
-        """Neutralizes leg-risk by aggressively routing offsetting orders via FIX protocol."""
-        logger.warning(f"Imbalance detected from order {trigger_cl_ord_id}. Dispatching automated defensive hedge over FIX...")
+        """Neutralizes leg-risk by aggressively routing offsetting orders via FIX protocol with pre-trade checks and latency tracking."""
+        logger.warning(f"Imbalance detected from order {trigger_cl_ord_id}. Evaluating automated defensive hedge...")
 
         for leg in self.config.legs:
-            # Route hedge order on the opposing leg
             aggressive_price = leg.limit_price - 0.50  # Cross spread to ensure immediate execution
-            logger.info(f"HEDGING ACTION [{leg.leg_id}]: Dispatching {filled_delta}MW delta @ Target £{aggressive_price:.2f}")
-
-            await self.fix_client.send_order(
-                cl_ord_id=f"HEDGE-{int(asyncio.get_event_loop().time())}",
-                symbol=leg.contract,
-                side="2",  # 2=Sell
-                order_qty=float(filled_delta),
+            
+            approved, reason = self.risk_engine.validate_order(
+                symbol=leg.contract, 
+                volume=float(filled_delta), 
                 price=aggressive_price
             )
+            
+            if not approved:
+                logger.error(f"RISK REJECTION ON HEDGE [{leg.leg_id}]: {reason}")
+                ORDER_COUNTER.labels(status="REJECTED_RISK", symbol=leg.contract).inc()
+                continue
+
+            logger.info(f"HEDGING ACTION [{leg.leg_id}]: Dispatching {filled_delta}MW delta @ Target £{aggressive_price:.2f}")
+
+            # Measure order execution latency using Prometheus histogram
+            with LATENCY_HISTOGRAM.time():
+                await self.fix_client.send_order(
+                    cl_ord_id=f"HEDGE-{int(asyncio.get_event_loop().time())}",
+                    symbol=leg.contract,
+                    side="2",  # 2=Sell
+                    order_qty=float(filled_delta),
+                    price=aggressive_price
+                )
+            
+            ORDER_COUNTER.labels(status="SENT", symbol=leg.contract).inc()
             logger.info(f"Offsetting order for [{leg.leg_id}] successfully transmitted via FIX.")
 
     async def run_live_gateway(self):
-        """Connects to exchange FIX gateway and starts the asynchronous telemetry/execution loop."""
+        """Connects to exchange FIX gateway and starts the asynchronous telemetry/execution loop using Iceberg Slicing."""
         await self.fix_client.connect()
 
         if not self.fix_client.is_connected:
@@ -130,28 +202,50 @@ class InstitutionalExecutionGateway:
         self.is_connected = True
         logger.info(f"Gateway live for strategy: {self.config.strategy_id}. Monitoring FIX session...")
 
-        # Spawn background task to continuously listen for incoming Execution Reports (MsgType = 8)
         listener_task = asyncio.create_task(
             self.fix_client.listen_loop(on_fill_callback=self.handle_exchange_fill)
         )
 
         try:
-            # Simulate an asynchronous trigger event (e.g., sudden interconnector tip / IGA supply swing)
             await asyncio.sleep(1.0)
-            logger.warning("Market Dislocation Triggered: Interconnector trip detected. Initiating primary leg execution...")
+            logger.warning("Market Dislocation Triggered: Interconnector trip detected. Initiating algorithmic Iceberg execution...")
 
             primary_leg = self.config.legs[0]
-            primary_cl_ord_id = f"PRIMARY-{int(asyncio.get_event_loop().time())}"
+            total_target_vol = float(self.config.emergency_slice_size_mw * 2)  # Larger parent block
+            slice_chunk_size = float(self.config.emergency_slice_size_mw)      # Hidden child slice size
 
-            await self.fix_client.send_order(
-                cl_ord_id=primary_cl_ord_id,
-                symbol=primary_leg.contract,
-                side="1",  # 1=Buy
-                order_qty=float(self.config.emergency_slice_size_mw),
-                price=primary_leg.limit_price
-            )
+            # Initialize Iceberg Slicer for stealth execution
+            slicer = IcebergSlicer(total_volume=total_target_vol, slice_size=slice_chunk_size, interval_seconds=0.5)
 
-            # Keep event loop alive to capture inbound fill confirmations
+            async for child_vol in slicer.slice_order():
+                primary_cl_ord_id = f"PRIMARY-ICEBERG-{int(asyncio.get_event_loop().time())}"
+                target_price = primary_leg.limit_price
+
+                # Run Pre-Trade Risk Check on each Iceberg child slice
+                approved, reason = self.risk_engine.validate_order(
+                    symbol=primary_leg.contract, 
+                    volume=child_vol, 
+                    price=target_price
+                )
+
+                if not approved:
+                    logger.critical(f"ICEBERG SLICE BLOCKED BY RISK ENGINE: {reason}")
+                    ORDER_COUNTER.labels(status="REJECTED_RISK", symbol=primary_leg.contract).inc()
+                    continue
+
+                # Measure transmission latency
+                with LATENCY_HISTOGRAM.time():
+                    await self.fix_client.send_order(
+                        cl_ord_id=primary_cl_ord_id,
+                        symbol=primary_leg.contract,
+                        side="1",  # 1=Buy
+                        order_qty=child_vol,
+                        price=target_price
+                    )
+                
+                ORDER_COUNTER.labels(status="SENT", symbol=primary_leg.contract).inc()
+                logger.info(f"Iceberg child slice of {child_vol}MW successfully sent to exchange.")
+
             await asyncio.sleep(5.0)
 
         finally:
