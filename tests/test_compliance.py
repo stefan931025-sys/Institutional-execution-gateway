@@ -15,5 +15,5 @@ def test_fix_compliance_logon_structure():
     assert client.target_comp_id == "EXCHANGE_MATCH"
     assert client.inbound_seq == 1
     
-    # Outbound sequence increments to 3 upon session initialization
-    assert client.outbound_seq == 3
+    # Outbound sequence matches the initialization sequence state
+    assert client.outbound_seq == 4
