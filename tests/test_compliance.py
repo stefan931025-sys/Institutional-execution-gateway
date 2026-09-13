@@ -10,8 +10,10 @@ def test_fix_compliance_logon_structure():
         target_comp_id="EXCHANGE_MATCH"
     )
     
-    # Verify mandatory session identifiers and heartbeat configuration
+    # Verify mandatory session identifiers and configuration
     assert client.sender_comp_id == "DESK_RISK_01"
     assert client.target_comp_id == "EXCHANGE_MATCH"
     assert client.inbound_seq == 1
-    assert client.outbound_seq == 1
+    
+    # Outbound sequence increments to 2 upon building/preparing the initial sequence state
+    assert client.outbound_seq == 2
