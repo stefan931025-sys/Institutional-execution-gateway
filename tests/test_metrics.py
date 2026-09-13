@@ -16,7 +16,7 @@ async def test_metrics_risk_rejection_increments():
     # Trigger an order that violates the size limit
     approved, reason = risk_engine.validate_order("BTC", mw_size=50.0, price=100.0)
     assert not approved
-    assert reason == "exceeds size limit"
+    assert "exceeds size limit" in reason  # Fixed to handle the detailed message string
 
     # Verify the Prometheus counter incremented by 1
     updated_val = REGISTRY.get_sample_value(metric_name, labels)
