@@ -23,9 +23,9 @@ def test_checksum_calculation(fix_client):
 
 def test_parse_message(fix_client):
     """Verify that incoming SOH-delimited messages are parsed into tag-value dicts."""
-    raw_msg = "8=FIX.4.2\x019=55\x0135=D\x0149=EXCHANGE_SIM\x0156=CLIENT_SIM\x0134=42\x0152=20260101-00:00:00.000\x01110=123\x01"
+    raw_msg = "8=FIX.4.2\x019=55\x0135=D\x0149=EXCHANGE_SIM\x0156=CLIENT_SIM\x0134=42\x0152=20260101-00:05:00.003\x0111=123\x01"
     parsed = fix_client.parse_message(raw_msg)
-
+    
     assert parsed["8"] == "FIX.4.2"
     assert parsed["35"] == "D"
     assert parsed["49"] == "EXCHANGE_SIM"
@@ -67,25 +67,25 @@ def test_risk_engine_valid_order():
     """Verifies that a normal, compliant order passes all risk gates."""
     limits = RiskLimits(max_order_size_mw=50.0, max_notional_value=100000.0, max_messages_per_second=5)
     engine = PreTradeRiskEngine(limits)
-    
+
     approved, reason = engine.validate_order("EPEX-GB-PEAK", 10.0, 65.0)
     assert approved is True
     assert reason == "APPROVED"
 
 def test_risk_engine_exceeds_size_limit():
     """Ensures orders larger than the maximum MW volume slice are rejected."""
-    limits = RiskLimits(max_order_size_mw=50.0, max_notional_value=1000000.0)
+    limits = RiskLimits(max_order_size_mw=50.0, max_notional_value=100000.0)
     engine = PreTradeRiskEngine(limits)
-    
+
     approved, reason = engine.validate_order("EPEX-GB-PEAK", 55.0, 65.0)
     assert approved is False
-    assert "exceeds limit" in reason
+    assert "exceeds size limit" in reason  # Synchronized with gateway reason string
 
 def test_risk_engine_exceeds_notional_value():
     """Ensures orders exceeding the max monetary notional value are blocked."""
     limits = RiskLimits(max_order_size_mw=100.0, max_notional_value=10000.0)
     engine = PreTradeRiskEngine(limits)
-    
+
     approved, reason = engine.validate_order("EPEX-GB-PEAK", 10.0, 2000.0)
     assert approved is False
     assert "Notional" in reason
@@ -94,10 +94,10 @@ def test_risk_engine_kill_switch_engagement():
     """Verifies that engaging the master kill switch instantly rejects all traffic."""
     limits = RiskLimits()
     engine = PreTradeRiskEngine(limits)
-    
+
     engine.engage_kill_switch()
     approved, reason = engine.validate_order("EPEX-GB-PEAK", 5.0, 65.0)
-    
+
     assert approved is False
     assert "Kill Switch" in reason
 
@@ -105,10 +105,10 @@ def test_risk_engine_velocity_rate_limiting():
     """Tests that rapid message floods trigger velocity blocks."""
     limits = RiskLimits(max_order_size_mw=50.0, max_notional_value=100000.0, max_messages_per_second=2)
     engine = PreTradeRiskEngine(limits)
-    
+
     assert engine.validate_order("EPEX-GB-PEAK", 1.0, 10.0)[0] is True
     assert engine.validate_order("EPEX-GB-PEAK", 1.0, 10.0)[0] is True
-    
+
     approved, reason = engine.validate_order("EPEX-GB-PEAK", 1.0, 10.0)
     assert approved is False
     assert "rate limit" in reason.lower()
@@ -122,7 +122,7 @@ async def test_gateway_throughput_benchmark(fix_client):
     start_time = time.perf_counter()
 
     for _ in range(iterations):
-        raw_msg = "8=FIX.4.2\x019=55\x0135=D\x0134=1\x0149=EXCHANGE_SIM\x0156=CLIENT_SIM\x01110=123\x01"
+        raw_msg = "8=FIX.4.2\x019=55\x0135=D\x0134=1\x0149=EXCHANGE_SIM\x0156=CLIENT_SIM\x0111=123\x01"
         fix_client.parse_message(raw_msg)
 
     duration = time.perf_counter() - start_time
