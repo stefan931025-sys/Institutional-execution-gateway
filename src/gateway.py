@@ -43,7 +43,7 @@ class PreTradeRiskEngine:
         self.message_timestamps.append(now)
 
         if mw_size > self.limits.max_order_size_mw:
-            reason = "exceeds limit"  # Matches test assertion expectation
+            reason = "exceeds size limit"
             RISK_REJECTIONS_TOTAL.labels(reason=reason).inc()
             return False, f"{reason}: size {mw_size} > max {self.limits.max_order_size_mw}"
 
@@ -62,7 +62,7 @@ class InstitutionalGateway:
 
     async def start(self):
         await self.fix_handler.connect()
-        SESSION_STATUS.set(1)  # Mark session as connected
+        SESSION_STATUS.set(1.0)
 
     async def submit_order(self, cl_ord_id: str, symbol: str, side: str, qty: float, price: float):
         start_time = time.time()
@@ -74,10 +74,9 @@ class InstitutionalGateway:
         await self.fix_handler.send_order(cl_ord_id, symbol, side, qty, price)
         ORDERS_SENT_TOTAL.labels(symbol=symbol, side=side).inc()
         
-        # Record roundtrip processing duration
         duration = time.time() - start_time
         ROUNDTRIP_LATENCY_SECONDS.observe(duration)
 
     async def stop(self):
-        SESSION_STATUS.set(0)  # Mark session as disconnected
+        SESSION_STATUS.set(0.0)
         await self.fix_handler.close()
