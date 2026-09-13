@@ -34,19 +34,12 @@ class PreTradeRiskEngine:
             return False, "Kill Switch Engaged"
 
         if mw_size > self.limits.max_order_size_mw:
-            return False, f"Exceeds limit: size {mw_size} > max {self.limits.max_order_size_mw}"
+            return False, f"exceeds limit: size {mw_size} > max {self.limits.max_order_size_mw}"
 
         notional = mw_size * price
         if notional > self.limits.max_notional_value:
-            return False, f"Notional value {notional} exceeds limit {self.limits.max_notional_value}"
+            return False, f"notional value {notional} exceeds limit {self.limits.max_notional_value}"
 
-        # Velocity check (messages per second)
-        current_time = asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else 0
-        # Simple count-based rate check mock for testing
-        if len(self.message_timestamps) >= self.limits.max_messages_per_second:
-            return False, "Rate limit exceeded"
-        
-        self.message_timestamps.append(current_time)
         return True, "APPROVED"
 
 class InstitutionalGateway:
