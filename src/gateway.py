@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Tuple
 from fix_handler import FIXHandler
 
@@ -33,12 +34,19 @@ class PreTradeRiskEngine:
         if self.kill_switch:
             return False, "Kill Switch Engaged"
 
+        # Velocity rate-limiting check
+        now = time.time()
+        self.message_timestamps = [ts for ts in self.message_timestamps if now - ts < 1.0]
+        if len(self.message_timestamps) >= self.limits.max_messages_per_second:
+            return False, "Rate limit exceeded"
+        self.message_timestamps.append(now)
+
         if mw_size > self.limits.max_order_size_mw:
             return False, f"exceeds limit: size {mw_size} > max {self.limits.max_order_size_mw}"
 
         notional = mw_size * price
         if notional > self.limits.max_notional_value:
-            return False, f"notional value {notional} exceeds limit {self.limits.max_notional_value}"
+            return False, f"Notional value {notional} exceeds limit {self.limits.max_notional_value}"
 
         return True, "APPROVED"
 
