@@ -43,7 +43,7 @@ class PreTradeRiskEngine:
         self.message_timestamps.append(now)
 
         if mw_size > self.limits.max_order_size_mw:
-            reason = "exceeds size limit"
+            reason = "exceeds limit"  # Matches test assertion expectation
             RISK_REJECTIONS_TOTAL.labels(reason=reason).inc()
             return False, f"{reason}: size {mw_size} > max {self.limits.max_order_size_mw}"
 
