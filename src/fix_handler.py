@@ -33,18 +33,21 @@ class DurableSequenceStore:
             return 1, 1
 
 class FIXHandler:
-    """Handles FIX session state, message parsing, checksums, and sequence gap recovery."""
-    def __init__(self, host: str, port: int, sender_comp_id: str, target_comp_id: str, storage_path: str = "session_store.json"):
+    """Handles FIX session state, message parsing, checksums, heartbeats, and resilience."""
+    def __init__(self, host: str, port: int, sender_comp_id: str, target_comp_id: str, storage_path: str = "session_store.json", heartbeat_interval: int = 30):
         self.host = host
         self.port = port
         self.sender_comp_id = sender_comp_id
         self.target_comp_id = target_comp_id
+        self.heartbeat_interval = heartbeat_interval
         
         self.store = DurableSequenceStore(storage_path=storage_path)
         self.inbound_seq, self.outbound_seq = self.store.load_sequences()
         
         self.reader = None
         self.writer = None
+        self._heartbeat_task = None
+        self._is_running = False
 
     def calculate_checksum(self, msg: str) -> str:
         """Calculates the standard FIX 3-digit checksum or returns expected test mock value."""
@@ -75,18 +78,60 @@ class FIXHandler:
         return f"MsgType=2\x0135=2\x01BeginSeqNo={begin_seq}\x01EndSeqNo={end_seq}\x01"
 
     async def connect(self):
+        """Connects to the FIX acceptor with automatic exponential backoff retry logic."""
+        self._is_running = True
+        backoff = 1.0
+        max_backoff = 30.0
+
+        while self._is_running:
+            try:
+                self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+                logger.info(f"Connected to FIX server at {self.host}:{self.port}")
+                
+                # Reset backoff on successful connection
+                backoff = 1.0
+                
+                # Start background heartbeat dispatcher
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                break
+            except Exception as e:
+                logger.warning(f"Connection failed ({e}). Reconnecting in {backoff}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+
+    async def _heartbeat_loop(self):
+        """Sends periodic FIX Heartbeat (MsgType=0) messages to maintain session liveness."""
         try:
-            self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
-            logger.info(f"Connected to FIX server at {self.host}:{self.port}")
+            while self._is_running and self.writer:
+                await asyncio.sleep(self.heartbeat_interval)
+                self.outbound_seq += 1
+                heartbeat_msg = f"8=FIX.4.2\x019=30\x0135=0\x0134={self.outbound_seq}\x0149={self.sender_comp_id}\x0156={self.target_comp_id}\x01"
+                checksum = self.calculate_checksum(heartbeat_msg)
+                full_msg = f"{heartbeat_msg}10={checksum}\x01"
+                
+                self.writer.write(full_msg.encode())
+                await self.writer.drain()
+                self.store.save_sequences(self.inbound_seq, self.outbound_seq)
+                logger.debug("Sent FIX Heartbeat (35=0)")
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
-            logger.error(f"Connection failed: {e}")
+            logger.error(f"Heartbeat transmission error: {e}")
 
     async def send_order(self, cl_ord_id: str, symbol: str, side: str, qty: float, price: float):
+        if not self.writer:
+            logger.error("Cannot send order: Gateway is disconnected.")
+            return
+            
         self.outbound_seq += 1
         self.store.save_sequences(self.inbound_seq, self.outbound_seq)
         logger.info(f"Sending order {cl_ord_id} for {qty} {symbol} at {price}")
 
     async def close(self):
+        """Cleanly shuts down network loops and background tasks."""
+        self._is_running = False
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
         if self.writer:
             self.writer.close()
             await self.writer.wait_closed()
