@@ -21,14 +21,16 @@ class DurableSequenceStore:
 
     def load_sequences(self) -> Tuple[int, int]:
         if not os.path.exists(self.storage_path):
-            return 0, 0
+            return 1, 1
         try:
             with open(self.storage_path, "r") as f:
                 data = json.load(f)
-                return data.get("inbound_seq", 0), data.get("outbound_seq", 0)
+                inbound = data.get("inbound_seq", 1)
+                outbound = data.get("outbound_seq", 1)
+                return max(1, inbound), max(1, outbound)
         except Exception as e:
             logger.error(f"Failed to load sequence state: {e}")
-            return 0, 0
+            return 1, 1
 
 class FIXHandler:
     """Handles FIX session state, message parsing, checksums, and sequence gap recovery."""
@@ -38,11 +40,9 @@ class FIXHandler:
         self.sender_comp_id = sender_comp_id
         self.target_comp_id = target_comp_id
         
-        self.inbound_seq = 0
-        self.outbound_seq = 0
         self.store = DurableSequenceStore(storage_path=storage_path)
-        
         self.inbound_seq, self.outbound_seq = self.store.load_sequences()
+        
         self.reader = None
         self.writer = None
 
