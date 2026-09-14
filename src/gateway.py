@@ -1,9 +1,17 @@
 import asyncio
 import logging
+from prometheus_client import Counter
 from fix_handler import FIXHandler
 from multileg_router import MultiLegRouter
 
 logger = logging.getLogger("InstitutionalGateway")
+
+# Define Prometheus metrics to match the test suite
+RISK_REJECTIONS_COUNTER = Counter(
+    "fix_gateway_risk_rejections_total",
+    "Total number of orders rejected by pre-trade risk engine",
+    ["reason"]
+)
 
 class RiskLimits:
     """Defines pre-trade risk boundaries with flexible keyword argument support."""
@@ -36,11 +44,17 @@ class PreTradeRiskEngine:
 
         notional = qty * price
         if qty > self.limits.max_order_size:
+            reason = "exceeds size limit"
             logger.warning(f"Risk Check Failed: Quantity {qty} exceeds max limit {self.limits.max_order_size}")
-            return False, "exceeds size limit"
+            RISK_REJECTIONS_COUNTER.labels(reason=reason).inc()
+            return False, reason
+            
         if notional > self.limits.max_notional:
+            reason = "exceeds notional limit"
             logger.warning(f"Risk Check Failed: Notional {notional} exceeds max limit {self.limits.max_notional}")
-            return False, "exceeds notional limit"
+            RISK_REJECTIONS_COUNTER.labels(reason=reason).inc()
+            return False, reason
+            
         return True, ""
 
 
