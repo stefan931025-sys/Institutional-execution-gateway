@@ -12,15 +12,12 @@ def fix_client():
 
 def test_fix_compliance_logon_structure(fix_client):
     """Verify that generated Logon (MsgType=A) messages contain mandatory institutional compliance fields."""
-    # Generate a standard logon message using the FIX handler
     logon_msg = fix_client.generate_logon_message(heartbeat_secs=10)
     parsed = fix_client.parse_message(logon_msg)
 
-    # Mandatory FIX compliance checks for session initiation
     assert parsed.get("35") == "A", "Message Type must be Logon (A)."
     assert "98" in parsed, "EncryptedMethod field is mandatory for standard FIX logon."
     
-    # Verify HeartBtInt (Tag 108) matches expected configuration value (10 seconds)
     heartbeat_interval = parsed.get("108")
     assert int(heartbeat_interval) == 10, f"Expected Heartbeat interval to be 10, got {heartbeat_interval}"
 
@@ -30,7 +27,7 @@ def test_fix_compliance_header_tags(fix_client):
     parsed = fix_client.parse_message(raw_msg)
 
     assert parsed.get("8") == "FIX.4.2", "BeginString must specify FIX version."
-    assert parsed.get("49") == "SenderCompID should match client identifier."
-    assert parsed.get("56") == "TargetCompID should match exchange identifier."
+    assert parsed.get("49") == "CLIENT_SIM", "SenderCompID should match client identifier."
+    assert parsed.get("56") == "EXCHANGE_SIM", "TargetCompID should match exchange identifier."
     assert "34" in parsed, "MsgSeqNum is mandatory."
     assert "52" in parsed, "SendingTime is mandatory."
