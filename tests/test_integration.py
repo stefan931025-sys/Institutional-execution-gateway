@@ -18,11 +18,16 @@ async def test_gateway_roundtrip_integration():
 
     try:
         # 2. Initialize and start the institutional gateway client
-        gateway = InstitutionalGateway(host=host, port=port, sender_comp_id="CLIENT_SIM", target_comp_id="EXCHANGE_SIM")
+        gateway = InstitutionalGateway(
+            host=host, 
+            port=port, 
+            sender_comp_id="CLIENT_SIM", 
+            target_comp_id="EXCHANGE_SIM"
+        )
         await gateway.start()
 
         # Verify connection is established
-        assert gateway.fix_handler.writer is not None
+        assert gateway.fix_handler.writer is not None, "Gateway client socket writer should be initialized."
 
         # 3. Submit a valid order through the risk engine and gateway
         await gateway.submit_order(
@@ -30,7 +35,7 @@ async def test_gateway_roundtrip_integration():
             symbol="EPEX-GB-PEAK",
             side="BUY",
             qty=10.0,
-            price=65.0
+            price=45.0
         )
 
         # Allow async socket transmission time
