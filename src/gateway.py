@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from metrics import RISK_REJECTIONS_COUNTER
+from metrics import RISK_REJECTIONS_TOTAL
 from fix_handler import FIXHandler
 from multileg_router import MultiLegRouter
 
@@ -39,13 +39,13 @@ class PreTradeRiskEngine:
         if qty > self.limits.max_order_size:
             reason = "exceeds size limit"
             logger.warning(f"Risk Check Failed: Quantity {qty} exceeds max limit {self.limits.max_order_size}")
-            RISK_REJECTIONS_COUNTER.labels(reason=reason).inc()
+            RISK_REJECTIONS_TOTAL.labels(reason=reason).inc()
             return False, reason
             
         if notional > self.limits.max_notional:
             reason = "exceeds notional limit"
             logger.warning(f"Risk Check Failed: Notional {notional} exceeds max limit {self.limits.max_notional}")
-            RISK_REJECTIONS_COUNTER.labels(reason=reason).inc()
+            RISK_REJECTIONS_TOTAL.labels(reason=reason).inc()
             return False, reason
             
         return True, ""
