@@ -1,17 +1,10 @@
 import asyncio
 import logging
-from prometheus_client import Counter
+from metrics import RISK_REJECTIONS_COUNTER
 from fix_handler import FIXHandler
 from multileg_router import MultiLegRouter
 
 logger = logging.getLogger("InstitutionalGateway")
-
-# Define Prometheus metrics to match the test suite
-RISK_REJECTIONS_COUNTER = Counter(
-    "fix_gateway_risk_rejections_total",
-    "Total number of orders rejected by pre-trade risk engine",
-    ["reason"]
-)
 
 class RiskLimits:
     """Defines pre-trade risk boundaries with flexible keyword argument support."""
