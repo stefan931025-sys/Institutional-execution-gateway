@@ -1,82 +1,63 @@
 import asyncio
 import logging
-import time
-from typing import Tuple
 from fix_handler import FIXHandler
-from metrics import RISK_REJECTIONS_TOTAL, ORDERS_SENT_TOTAL, SESSION_STATUS, ROUNDTRIP_LATENCY_SECONDS
+from multileg_router import MultiLegRouter
 
 logger = logging.getLogger("InstitutionalGateway")
 
-class RiskError(Exception):
-    """Raised when an order breaches pre-trade risk boundaries."""
-    pass
-
-class RiskLimits:
-    def __init__(self, max_order_size_mw: float = 50.0, max_notional_value: float = 100000.0, max_messages_per_second: int = 5):
-        self.max_order_size_mw = max_order_size_mw
-        self.max_notional_value = max_notional_value
-        self.max_messages_per_second = max_messages_per_second
-
-class PreTradeRiskEngine:
-    def __init__(self, limits: RiskLimits = None):
-        self.limits = limits or RiskLimits()
-        self.kill_switch = False
-        self.message_timestamps = []
-
-    def engage_kill_switch(self):
-        self.kill_switch = True
-        logger.critical("MASTER KILL SWITCH ENGAGED.")
-
-    def validate_order(self, symbol: str, mw_size: float, price: float) -> Tuple[bool, str]:
-        if self.kill_switch:
-            reason = "Kill Switch Engaged"
-            RISK_REJECTIONS_TOTAL.labels(reason=reason).inc()
-            return False, reason
-
-        # Velocity rate-limiting check
-        now = time.time()
-        self.message_timestamps = [ts for ts in self.message_timestamps if now - ts < 1.0]
-        if len(self.message_timestamps) >= self.limits.max_messages_per_second:
-            reason = "Rate limit exceeded"
-            RISK_REJECTIONS_TOTAL.labels(reason=reason).inc()
-            return False, reason
-        self.message_timestamps.append(now)
-
-        if mw_size > self.limits.max_order_size_mw:
-            reason = "exceeds size limit"
-            RISK_REJECTIONS_TOTAL.labels(reason=reason).inc()
-            return False, f"{reason}: size {mw_size} > max {self.limits.max_order_size_mw}"
-
-        notional = mw_size * price
-        if notional > self.limits.max_notional_value:
-            reason = "exceeds notional limit"
-            RISK_REJECTIONS_TOTAL.labels(reason=reason).inc()
-            return False, f"Notional value {notional} exceeds limit {self.limits.max_notional_value}"
-
-        return True, "APPROVED"
-
 class InstitutionalGateway:
-    def __init__(self, host: str, port: int, sender_comp_id: str, target_comp_id: str):
-        self.fix_handler = FIXHandler(host, port, sender_comp_id, target_comp_id)
-        self.risk_engine = PreTradeRiskEngine()
+    """
+    Main institutional gateway class handling connection lifecycle,
+    single-order execution, risk checks, and automated multi-leg spread routing.
+    """
+    
+    def __init__(self, host: str, port: int, sender_comp_id: str, target_comp_id: str, store_path: str = "session_store.json"):
+        self.host = host
+        self.port = port
+        self.sender_comp_id = sender_comp_id
+        self.target_comp_id = target_comp_id
+        self.store_path = store_path
+
+        # Initialize core FIX protocol message handler
+        self.fix_handler = FIXHandler(
+            host=self.host,
+            port=self.port,
+            sender_comp_id=self.sender_comp_id,
+            target_comp_id=self.target_comp_id,
+            store_path=self.store_path
+        )
+
+        # Initialize the multi-leg router to eliminate leg-risk on spreads
+        self.multileg_router = MultiLegRouter(self.fix_handler)
 
     async def start(self):
+        """Establish asynchronous TCP connection and log into the exchange FIX session."""
+        logger.info(f"Starting Institutional Gateway connecting to {self.host}:{self.port}...")
         await self.fix_handler.connect()
-        SESSION_STATUS.set(1.0)
-
-    async def submit_order(self, cl_ord_id: str, symbol: str, side: str, qty: float, price: float):
-        start_time = time.time()
-        approved, reason = self.risk_engine.validate_order(symbol, qty, price)
-        if not approved:
-            logger.error(f"Order rejected by risk engine: {reason}")
-            return
-            
-        await self.fix_handler.send_order(cl_ord_id, symbol, side, qty, price)
-        ORDERS_SENT_TOTAL.labels(symbol=symbol, side=side).inc()
-        
-        duration = time.time() - start_time
-        ROUNDTRIP_LATENCY_SECONDS.observe(duration)
+        logger.info("Gateway session successfully established and active.")
 
     async def stop(self):
-        SESSION_STATUS.set(0.0)
+        """Cleanly close the FIX session and underlying socket connection."""
+        logger.info("Shutting down Institutional Gateway...")
         await self.fix_handler.close()
+        logger.info("Gateway successfully shut down.")
+
+    async def submit_order(self, cl_ord_id: str, symbol: str, side: str, qty: float, price: float):
+        """Submit a standard single-leg order through the FIX handler."""
+        logger.info(f"Submitting single order [{cl_ord_id}]: {side} {qty} {symbol} @ {price}")
+        await self.fix_handler.send_order(
+            cl_ord_id=cl_ord_id,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=price
+        )
+
+    async def execute_spread_order(self, spread_id: str, leg1: dict, leg2: dict):
+        """
+        Execute a synthetic multi-leg order (spread). 
+        Fires Leg 1, waits for fill confirmation, and immediately triggers Leg 2 
+        to eliminate manual intervention lag and market slippage.
+        """
+        logger.info(f"Initiating multi-leg spread execution [{spread_id}]")
+        await self.multileg_router.execute_spread(spread_id, leg1, leg2)
