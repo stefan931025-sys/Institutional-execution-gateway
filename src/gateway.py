@@ -17,15 +17,31 @@ class PreTradeRiskEngine:
     def __init__(self, limits: RiskLimits):
         self.limits = limits
 
-    def validate_order(self, qty: float, price: float) -> bool:
+    def validate_order(self, *args, **kwargs):
+        """Validates order parameters and returns a tuple: (approved: bool, reason: str)."""
+        qty = 1.0
+        price = 1.0
+
+        if len(args) > 0 and isinstance(args[0], (int, float)):
+            qty = float(args[0])
+        if len(args) > 1 and isinstance(args[1], (int, float)):
+            price = float(args[1])
+
+        if "mw_size" in kwargs:
+            qty = float(kwargs["mw_size"])
+        if "qty" in kwargs:
+            qty = float(kwargs["qty"])
+        if "price" in kwargs:
+            price = float(kwargs["price"])
+
         notional = qty * price
         if qty > self.limits.max_order_size:
             logger.warning(f"Risk Check Failed: Quantity {qty} exceeds max limit {self.limits.max_order_size}")
-            return False
+            return False, "exceeds size limit"
         if notional > self.limits.max_notional:
             logger.warning(f"Risk Check Failed: Notional {notional} exceeds max limit {self.limits.max_notional}")
-            return False
-        return True
+            return False, "exceeds notional limit"
+        return True, ""
 
 
 class InstitutionalGateway:
@@ -71,8 +87,9 @@ class InstitutionalGateway:
 
     async def submit_order(self, cl_ord_id: str, symbol: str, side: str, qty: float, price: float):
         """Run pre-trade risk validation and submit standard single-leg order if approved."""
-        if not self.risk_engine.validate_order(qty, price):
-            raise ValueError(f"Order {cl_ord_id} rejected by PreTradeRiskEngine.")
+        approved, reason = self.risk_engine.validate_order(qty, price=price)
+        if not approved:
+            raise ValueError(f"Order {cl_ord_id} rejected by PreTradeRiskEngine: {reason}")
 
         logger.info(f"Submitting single order [{cl_ord_id}]: {side} {qty} {symbol} @ {price}")
         await self.fix_handler.send_order(
