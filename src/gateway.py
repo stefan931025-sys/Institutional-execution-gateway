@@ -7,8 +7,8 @@ logger = logging.getLogger("InstitutionalGateway")
 
 class RiskLimits:
     """Defines pre-trade risk boundaries."""
-    def __init__(self, max_order_qty: float = 1000.0, max_notional: float = 100000.0):
-        self.max_order_qty = max_order_qty
+    def __init__(self, max_order_size: float = 1000.0, max_notional: float = 100000.0):
+        self.max_order_size = max_order_size
         self.max_notional = max_notional
 
 
@@ -19,8 +19,8 @@ class PreTradeRiskEngine:
 
     def validate_order(self, qty: float, price: float) -> bool:
         notional = qty * price
-        if qty > self.limits.max_order_qty:
-            logger.warning(f"Risk Check Failed: Quantity {qty} exceeds max limit {self.limits.max_order_qty}")
+        if qty > self.limits.max_order_size:
+            logger.warning(f"Risk Check Failed: Quantity {qty} exceeds max limit {self.limits.max_order_size}")
             return False
         if notional > self.limits.max_notional:
             logger.warning(f"Risk Check Failed: Notional {notional} exceeds max limit {self.limits.max_notional}")
