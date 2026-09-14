@@ -2,6 +2,7 @@ import time
 import json
 import os
 import logging
+import asyncio
 from typing import Dict, Tuple
 
 logger = logging.getLogger("FIXHandler")
