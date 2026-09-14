@@ -6,10 +6,10 @@ from multileg_router import MultiLegRouter
 logger = logging.getLogger("InstitutionalGateway")
 
 class RiskLimits:
-    """Defines pre-trade risk boundaries."""
-    def __init__(self, max_order_size: float = 1000.0, max_notional: float = 100000.0):
-        self.max_order_size = max_order_size
-        self.max_notional = max_notional
+    """Defines pre-trade risk boundaries with flexible keyword argument support."""
+    def __init__(self, **kwargs):
+        self.max_order_size = kwargs.get("max_order_size", kwargs.get("max_order_size_mw", 1000.0))
+        self.max_notional = kwargs.get("max_notional", 100000.0)
 
 
 class PreTradeRiskEngine:
