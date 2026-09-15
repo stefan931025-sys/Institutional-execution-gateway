@@ -1,0 +1,31 @@
+import asyncio
+import logging
+from fix_socket_client import FixSocketClient
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+async def main():
+    # Configuration parameters for your FIX endpoint / sandbox
+    HOST = "127.0.0.1"  # Replace with sandbox/broker endpoint
+    PORT = 9800         # Replace with target port
+    SENDER = "MY_FIRM_TRADER"
+    TARGET = "EXCHANGE_M7"
+
+    client = FixSocketClient(HOST, PORT, SENDER, TARGET)
+
+    # 1. Connect and initialize session state from database
+    await client.connect()
+
+    if client.is_connected:
+        # 2. Start background tasks (listening for fills & sending heartbeats)
+        listen_task = asyncio.create_task(client.listen_loop())
+        heartbeat_task = asyncio.create_task(client.start_heartbeat_loop(30))
+
+        # Example: Send a test order
+        await client.send_order(symbol="UK-POWER-SPOT", side="1", order_qty=10.0, price=65.50, cl_ord_id="ORD-2026-001")
+
+        # Keep running
+        await asyncio.gather(listen_task, heartbeat_task)
+
+if __name__ == "__main__":
+    asyncio.run(main())
