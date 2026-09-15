@@ -37,44 +37,44 @@ class FixSocketClient:
 
     def _format_fix_message(self, msg_type: str, body_fields: dict) -> bytes:
         """Construct raw FIX message with sequence numbers and checksum."""
-        body = f"35={msg_type}|49={self.sender_comp_id}|56={self.target_comp_id}|34={self.out_seq_num}|"
+        body = f"35={msg_type}\x0149={self.sender_comp_id}\x0156={self.target_comp_id}\x0134={self.out_seq_num}\x01"
         for tag, val in body_fields.items():
-            body += f"{tag}={val}|"
-            
-        header = f"8=FIX.4.2|9={len(body)}|"
+            body += f"{tag}={val}\x01"
+
+        header = f"8=FIX.4.2\x019={len(body)}\x01"
         raw_message = header + body
-        
+
         # Calculate checksum (Tag 10)
         checksum = sum(bytes(raw_message.replace('|', '\x01'), 'ascii')) % 256
         complete_message = raw_message.replace('|', '\x01') + f"10={checksum:03d}\x01"
-        
+
         # Increment outbound sequence number
         self.out_seq_num += 1
         return complete_message.encode('ascii')
 
     async def send_logon(self):
-        """Send FIX Logon message (35=A) and persist updated sequence state."""
+        """Send FIX Logon message (35-A) and persist updated sequence state."""
         if not self.is_connected:
             return
         logon_fields = {"98": "0", "108": "30"} # EncryptMethod, HeartBtInt
         msg = self._format_fix_message("A", logon_fields)
         self.writer.write(msg)
         await self.writer.drain()
-        
+
         await update_session_state(self.in_seq_num, self.out_seq_num, self.session_id)
         logger.info("Sent FIX Logon request and persisted state.")
 
     async def send_order(self, symbol: str, side: str, order_qty: float, price: float, cl_ord_id: str):
-        """Submit a New Order Single (35=D) to the exchange/sandbox."""
+        """Submit a New Order Single (35-D) to the exchange/sandbox."""
         if not self.is_connected or not self.writer:
             logger.error("Cannot send order: Not connected.")
             return False
 
         order_fields = {
             "11": cl_ord_id,
-            "54": side,                # '1' = Buy, '2' = Sell
+            "54": side,           # '1' = Buy, '2' = Sell
             "38": str(order_qty),
-            "40": "2",                 # Limit Order
+            "40": "2",            # Limit Order
             "44": str(price),
             "55": symbol,
             "60": str(asyncio.get_event_loop().time())
@@ -86,21 +86,25 @@ class FixSocketClient:
 
         # Persist initial order state locally
         await persist_order_status(
-            order_id="PENDING_" + cl_ord_id, 
-            cl_ord_id=cl_ord_id, 
-            symbol=symbol, 
-            side=side, 
-            price=price, 
-            qty=order_qty, 
+            order_id="PENDING_" + cl_ord_id,
+            cl_ord_id=cl_ord_id,
+            symbol=symbol,
+            side=side,
+            price=price,
+            qty=order_qty,
             status="NEW"
         )
-        
+
         await update_session_state(self.in_seq_num, self.out_seq_num, self.session_id)
-        logger.info(f"New Order Single sent: ClOrdID={cl_ord_id} {side} {order_qty} @ {price}")
+        logger.info(f"New Order Single sent. ClOrdID={cl_ord_id} {side} {order_qty} @ {price}")
         return True
 
     async def listen_loop(self):
-        """Continuously listen for incoming network traffic and parse messages."""
+        """Continuously listen for incoming network traffic with a persistent byte buffer 
+        to handle TCP packet fragmentation and stream framing safely.
+        """
+        buffer = bytearray()
+        
         while self.is_connected:
             try:
                 data = await self.reader.read(4096)
@@ -108,8 +112,33 @@ class FixSocketClient:
                     logger.warning("Connection lost from server.")
                     break
                 
-                message = data.decode('ascii', errors='ignore')
-                await self.handle_incoming_message(message)
+                buffer.extend(data)
+                
+                # FIX messages start with '8=FIX' and end with the Checksum field '10=XXX\x01'
+                while True:
+                    start_idx = buffer.find(b'8=FIX')
+                    if start_idx == -1:
+                        if len(buffer) > 65536:
+                            buffer.clear()
+                        break
+                    
+                    if start_idx > 0:
+                        del buffer[:start_idx]
+                        
+                    trailer_idx = buffer.find(b'\x0110=')
+                    if trailer_idx == -1:
+                        break
+                        
+                    end_idx = buffer.find(b'\x01', trailer_idx + 1)
+                    if end_idx == -1:
+                        break
+                        
+                    complete_msg_bytes = buffer[:end_idx + 1]
+                    del buffer[:end_idx + 1]
+                    
+                    message_str = complete_msg_bytes.decode('ascii', errors='ignore')
+                    await self.handle_incoming_message(message_str)
+                    
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -119,26 +148,26 @@ class FixSocketClient:
     async def handle_incoming_message(self, raw_message: str):
         """Parse incoming bytes, increment inbound sequence, and persist reports."""
         fields = dict(item.split('=') for item in raw_message.replace('\x01', '|').strip('|').split('|'))
-        
+
         # Track inbound sequence number from header (Tag 34)
         if "34" in fields:
             self.in_seq_num = int(fields["34"]) + 1
             await update_session_state(self.in_seq_num, self.out_seq_num, self.session_id)
 
         msg_type = fields.get("35")
-        
+
         if msg_type == "0":
             logger.debug("Received Heartbeat.")
         elif msg_type == "8": # Execution Report
-            order_id = fields.get('37', 'UNKNOWN')
-            cl_ord_id = fields.get('11', 'UNKNOWN')
-            symbol = fields.get('55', 'UNKNOWN')
-            side = fields.get('54', 'UNKNOWN')
-            price = float(fields.get('44', 0.0))
-            qty = float(fields.get('38', 0.0))
-            status = fields.get('39', 'UNKNOWN')
-            filled_qty = float(fields.get('14', 0.0))
-            
+            order_id = fields.get("37", "UNKNOWN")
+            cl_ord_id = fields.get("11", "UNKNOWN")
+            symbol = fields.get("55", "UNKNOWN")
+            side = fields.get("54", "UNKNOWN")
+            price = float(fields.get("44", 0.0))
+            qty = float(fields.get("38", 0.0))
+            status = fields.get("39", "UNKNOWN")
+            filled_qty = float(fields.get("14", 0.0))
+
             await persist_order_status(order_id, cl_ord_id, symbol, side, price, qty, status, filled_qty)
             logger.info(f"Execution Report processed & saved: OrderID={order_id} Status={status}")
 
