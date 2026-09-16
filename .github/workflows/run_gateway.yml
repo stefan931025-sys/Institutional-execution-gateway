@@ -23,17 +23,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Locate and Run main.py
+      - name: Start Exchange Simulator (Background)
         run: |
-          echo "Searching for main.py in the workspace:"
-          find . -name "main.py"
-          
-          # Dynamically find the file path and run it
-          MAIN_PATH=$(find . -name "main.py" | head -n 1)
-          if [ -z "$MAIN_PATH" ]; then
-            echo "Error: main.py could not be found anywhere in the repository!"
-            exit 1
-          fi
-          
-          echo "Executing found script at: $MAIN_PATH"
-          python "$MAIN_PATH"
+          python exchange_simulator.py &
+          sleep 2 # Give the simulator time to bind to port 9800
+
+      - name: Run Institutional Execution Gateway
+        run: |
+          python main.py
