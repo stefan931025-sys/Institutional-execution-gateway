@@ -13,7 +13,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
@@ -26,8 +26,11 @@ jobs:
       - name: Start Exchange Simulator (Background)
         run: |
           python exchange_simulator.py &
-          sleep 2
+          sleep 2 # Give the simulator time to bind to port 9800
 
       - name: Run Institutional Execution Gateway
+        env:
+          # Replace YOUR_SECRET_NAME with the exact name you used in your GitHub repository secrets
+          YOUR_SECRET_NAME: ${{ secrets.YOUR_SECRET_NAME }}
         run: |
           python main.py
