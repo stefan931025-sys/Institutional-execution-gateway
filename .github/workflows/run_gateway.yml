@@ -30,7 +30,6 @@ jobs:
 
       - name: Run Institutional Execution Gateway
         env:
-          # Replace YOUR_SECRET_NAME with your exact secret name, referencing your Codespace/server endpoint
-          YOUR_SECRET_NAME: "https://literate-tribble-gx496vrw5rr6fv69-9800.app.github.dev/"
+          FIX_ENDPOINT_URL: ${{ secrets.FIX_ENDPOINT_URL }}
         run: |
           python main.py
