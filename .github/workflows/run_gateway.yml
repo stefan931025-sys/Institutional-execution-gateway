@@ -30,6 +30,6 @@ jobs:
 
       - name: Run Institutional Execution Gateway
         env:
-          FIX_ENDPOINT_URL: ${{ secrets.FIX_ENDPOINT_URL }}
+          FIX_SERVER_HOST: ${{ secrets.FIX_SERVER_HOST }}
         run: |
           python main.py
