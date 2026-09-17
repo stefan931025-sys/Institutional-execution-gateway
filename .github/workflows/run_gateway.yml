@@ -26,7 +26,7 @@ jobs:
       - name: Start Exchange Simulator (Background)
         run: |
           python exchange_simulator.py &
-          sleep 2 # Give the simulator time to bind to port 9800
+          sleep 2
 
       - name: Run Institutional Execution Gateway
         run: |
