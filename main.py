@@ -1,3 +1,4 @@
+import sys
 import asyncio
 import logging
 from fix_socket_client import FixSocketClient
@@ -8,7 +9,7 @@ logger = logging.getLogger(__name__)
 async def main():
     # Configuration parameters for your FIX endpoint / sandbox
     HOST = "127.0.0.1"  # Replace with sandbox/broker endpoint
-    PORT = 9800         # Replace with target port
+    PORT = 9800        # Replace with target port
     SENDER = "MY_FIRM_TRADER"
     TARGET = "EXCHANGE_M"
 
@@ -29,20 +30,28 @@ async def main():
         # Example: Send a test order after a short pause
         await asyncio.sleep(2)
         await client.send_order(
-            symbol="UK-POWER-SPOT", 
-            side="1", 
-            order_qty=10.0, 
-            price=65.50, 
+            symbol="UK-POWER-SPOT",
+            side="1",
+            order_qty=10.0,
+            price=65.50,
             cl_ord_id="ORD-2026-001"
         )
 
-        # Keep running and wait for tasks
+        # Allow time for execution reports to return
+        await asyncio.sleep(2)
+
+        # If running in CI mode or non-blocking test, exit cleanly after sending order
+        if "--ci" in sys.argv:
+            logger.info("CI test completed successfully. Shutting down gateway.")
+            return
+
+        # Keep running indefinitely for normal deployment
         await asyncio.gather(listen_task, heartbeat_task)
-        
+
     except asyncio.CancelledError:
         logger.info("Gateway shutting down...")
     finally:
-        # Ensure background tasks are cleanly cancelled if an error occurs
+        # Ensure background tasks are cleanly cancelled on exit
         listen_task.cancel()
         heartbeat_task.cancel()
         logger.info("Gateway stopped.")
