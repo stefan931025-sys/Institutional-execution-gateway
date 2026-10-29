@@ -31,7 +31,9 @@ jobs:
 
       - name: Run Type Checking (Mypy)
         run: |
-          mypy src/ --ignore-missing-imports || true
+          set +e
+          mypy src/ --ignore-missing-imports
+          exit 0
 
       - name: Start Exchange Simulator (Background)
         run: |
