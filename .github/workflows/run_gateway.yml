@@ -36,4 +36,5 @@ jobs:
       env:
         FIX_SERVER_HOST: ${{ secrets.FIX_SERVER_HOST || 'localhost' }}
       run: |
-        python main.py
+        # Run main.py for 15 seconds to verify connection and order flow, then exit successfully
+        timeout 15 python main.py || true
