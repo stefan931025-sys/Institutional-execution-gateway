@@ -28,17 +28,14 @@ jobs:
 
     - name: Run Linting (Flake8)
       run: |
-        # Only fail on critical syntax errors (E9, F63, F7, F82), allow style warnings safely
         flake8 --count --select=E9,F63,F7,F82 --show-source --statistics || true
 
     - name: Run Type Checking (Mypy)
       run: |
-        # Ignore missing third-party library stubs without breaking the build
         mypy src --ignore-missing-imports || true
 
     - name: Run Security Scan (Bandit)
       run: |
-        # Scan code for security issues, bypass low-severity notes safely
         bandit -r . -ll || true
 
     - name: Run Pytest
