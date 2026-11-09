@@ -26,7 +26,6 @@ jobs:
     - name: Start Exchange Simulator (Background)
       run: |
         python exchange_simulator.py &
-        # Robustly wait up to 10 seconds for port 9800 to open
         for i in {1..10}; do
           nc -z localhost 9800 && break
           sleep 1
@@ -36,5 +35,4 @@ jobs:
       env:
         FIX_SERVER_HOST: ${{ secrets.FIX_SERVER_HOST || 'localhost' }}
       run: |
-        # Run main.py for 15 seconds to verify connection and order flow, then exit successfully
         timeout 15 python main.py || true
