@@ -1,3 +1,4 @@
+import sys
 import asyncio
 import logging
 from database import init_db, load_session_state, update_session_state, persist_order_status
@@ -19,12 +20,12 @@ class FixSocketClient:
 
     async def initialize(self):
         """Initialize the database and load the last persisted session state."""
-        await init_db()
+        init_db()
         self.in_seq_num, self.out_seq_num = await load_session_state(self.session_id)
         logger.info(f"Session initialized from disk. InSeq={self.in_seq_num}, OutSeq={self.out_seq_num}")
 
     async def connect(self):
-        """Establish a real TCP connection and initialize session state first."""
+        """Establish a real TCP connection and initialize session state."""
         await self.initialize()
         try:
             self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
@@ -36,57 +37,57 @@ class FixSocketClient:
             self.is_connected = False
 
     def _format_fix_message(self, msg_type: str, body_fields: dict) -> bytes:
-        """Construct raw FIX message with sequence numbers and checksum."""
+        """Construct raw FIX message with sequence numbers, delimiters, and checksum."""
         body = f"35={msg_type}\x0149={self.sender_comp_id}\x0156={self.target_comp_id}\x0134={self.out_seq_num}\x01"
         for tag, val in body_fields.items():
             body += f"{tag}={val}\x01"
-
+        
         header = f"8=FIX.4.2\x019={len(body)}\x01"
         raw_message = header + body
-
-        # Calculate checksum (Tag 10)
-        checksum = sum(bytes(raw_message.replace('|', '\x01'), 'ascii')) % 256
-        complete_message = raw_message.replace('|', '\x01') + f"10={checksum:03d}\x01"
-
+        
+        # Calculate checksum (Tag 10) across standard ASCII bytes using direct \x01 delimiters
+        checksum = sum(bytearray(raw_message, "ascii")) % 256
+        complete_message = raw_message + f"10={checksum:03d}\x01"
+        
         # Increment outbound sequence number
         self.out_seq_num += 1
-        return complete_message.encode('ascii')
+        return complete_message.encode("ascii")
 
     async def send_logon(self):
-        """Send FIX Logon message (35-A) and persist updated sequence state."""
+        """Send FIX Logon message (35=A) and persist updated sequence state."""
         if not self.is_connected:
             return
-        logon_fields = {"98": "0", "108": "30"} # EncryptMethod, HeartBtInt
+        logon_fields = {"98": "0", "108": "30"}  # EncryptMethod, HeartBtInt
         msg = self._format_fix_message("A", logon_fields)
         self.writer.write(msg)
         await self.writer.drain()
-
+        
         await update_session_state(self.in_seq_num, self.out_seq_num, self.session_id)
         logger.info("Sent FIX Logon request and persisted state.")
 
-    async def send_order(self, symbol: str, side: str, order_qty: float, price: float, cl_ord_id: str):
-        """Submit a New Order Single (35-D) to the exchange/sandbox."""
+    async def send_order(self, symbol: str, side: str, order_qty: float, price: float, cl_ord_id: str) -> bool:
+        """Submit a New Order Single (35=D) to the exchange/sandbox."""
         if not self.is_connected or not self.writer:
             logger.error("Cannot send order: Not connected.")
             return False
 
         order_fields = {
             "11": cl_ord_id,
-            "54": side,           # '1' = Buy, '2' = Sell
+            "54": side,        # '1' = Buy, '2' = Sell
             "38": str(order_qty),
-            "40": "2",            # Limit Order
+            "40": "2",         # Limit Order
             "44": str(price),
             "55": symbol,
             "60": str(asyncio.get_event_loop().time())
         }
-
+        
         msg = self._format_fix_message("D", order_fields)
         self.writer.write(msg)
         await self.writer.drain()
 
         # Persist initial order state locally
         await persist_order_status(
-            order_id="PENDING_" + cl_ord_id,
+            order_id=f"PENDING_{cl_ord_id}",
             cl_ord_id=cl_ord_id,
             symbol=symbol,
             side=side,
@@ -96,24 +97,22 @@ class FixSocketClient:
         )
 
         await update_session_state(self.in_seq_num, self.out_seq_num, self.session_id)
-        logger.info(f"New Order Single sent. ClOrdID={cl_ord_id} {side} {order_qty} @ {price}")
+        logger.info(f"New Order Single sent. ClOrdID={cl_ord_id} ({side} {order_qty} @ {price})")
         return True
 
     async def listen_loop(self):
-        """Continuously listen for incoming network traffic with a persistent byte buffer 
-        to handle TCP packet fragmentation and stream framing safely.
-        """
+        """Continuously listen for incoming network traffic with a persistent byte buffer to handle TCP packet fragmentation and stream framing safely."""
         buffer = bytearray()
-        
+
         while self.is_connected:
             try:
                 data = await self.reader.read(4096)
                 if not data:
                     logger.warning("Connection lost from server.")
                     break
-                
+
                 buffer.extend(data)
-                
+
                 # FIX messages start with '8=FIX' and end with the Checksum field '10=XXX\x01'
                 while True:
                     start_idx = buffer.find(b'8=FIX')
@@ -121,24 +120,24 @@ class FixSocketClient:
                         if len(buffer) > 65536:
                             buffer.clear()
                         break
-                    
+
                     if start_idx > 0:
                         del buffer[:start_idx]
-                        
+
                     trailer_idx = buffer.find(b'\x0110=')
                     if trailer_idx == -1:
                         break
-                        
+
                     end_idx = buffer.find(b'\x01', trailer_idx + 1)
                     if end_idx == -1:
                         break
-                        
+
                     complete_msg_bytes = buffer[:end_idx + 1]
                     del buffer[:end_idx + 1]
-                    
+
                     message_str = complete_msg_bytes.decode('ascii', errors='ignore')
                     await self.handle_incoming_message(message_str)
-                    
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -158,7 +157,7 @@ class FixSocketClient:
 
         if msg_type == "0":
             logger.debug("Received Heartbeat.")
-        elif msg_type == "8": # Execution Report
+        elif msg_type == "8":  # Execution Report
             order_id = fields.get("37", "UNKNOWN")
             cl_ord_id = fields.get("11", "UNKNOWN")
             symbol = fields.get("55", "UNKNOWN")
@@ -173,11 +172,11 @@ class FixSocketClient:
 
     async def start_heartbeat_loop(self, interval: int = 30):
         """Background task to send periodic heartbeats to maintain the FIX session."""
-        while self.is_connected:
+        while self.is_connected and self.writer:
             try:
                 await asyncio.sleep(interval)
                 if self.is_connected and self.writer:
-                    msg = self._format_fix_message("0", {}) # Heartbeat (35=0)
+                    msg = self._format_fix_message("0", {})  # Heartbeat (35=0)
                     self.writer.write(msg)
                     await self.writer.drain()
                     await update_session_state(self.in_seq_num, self.out_seq_num, self.session_id)
