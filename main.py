@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 async def main():
     # Configuration parameters for your FIX endpoint / sandbox
     HOST = "127.0.0.1"  # Replace with sandbox/broker endpoint
-    PORT = 9800        # Replace with target port
+    PORT = 8000         # Replace with target port
     SENDER = "MY_FIRM_TRADER"
     TARGET = "EXCHANGE_M"
 
@@ -51,7 +51,7 @@ async def main():
     except asyncio.CancelledError:
         logger.info("Gateway shutting down...")
     finally:
-        # Ensure background tasks are cleanly cancelled on exit
+        # Ensure background tasks are clearly cancelled on exit
         listen_task.cancel()
         heartbeat_task.cancel()
         logger.info("Gateway stopped.")
