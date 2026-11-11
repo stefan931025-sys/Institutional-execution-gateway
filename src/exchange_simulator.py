@@ -9,7 +9,7 @@ logging.basicConfig(
 logger = logging.getLogger("ExchangeSimulator")
 
 class MockExchangeServer:
-    def __init__(self, host: str = "127.0.0.1", port: int = 9800):
+    def __init__(self, host: str = "127.0.0.1", port: int = 8000):
         self.host = host
         self.port = port
         self.out_seq_num = 1
@@ -30,7 +30,7 @@ class MockExchangeServer:
         
         body = "\x01".join(body_parts) + "\x01"
         now_utc = datetime.now(timezone.utc).strftime("%Y%m%d-%H:%M:%S.%f")[:-3]
-        
+
         header_base = (
             f"8=FIX.4.2\x01"
             f"9={len(body)}\x01"
@@ -40,11 +40,11 @@ class MockExchangeServer:
             f"34={self.out_seq_num}\x01"
             f"52={now_utc}\x01"
         )
-        
+
         raw_msg_without_trailer = header_base + body
         checksum_str = self._calculate_checksum(raw_msg_without_trailer)
         full_message = raw_msg_without_trailer + f"10={checksum_str}\x01"
-        
+
         self.out_seq_num += 1
         return full_message.encode("ascii")
 
@@ -72,13 +72,14 @@ class MockExchangeServer:
 
                 raw_str = data.decode("ascii", errors="ignore")
                 messages = raw_str.split("10=")
+                
                 for msg in messages[:-1]:
-                    full_msg = msg + "10=" + messages[messages.index(msg) + 1][:3] + "\x01"
+                    full_msg = "10=" + msg.split("\x01")[0] + "\x01"
                     fields = self.parse_message(full_msg)
                     msg_type = fields.get(35)
-                    seq_num = fields.get(34)
-                    
-                    logger.info(f"Received [MsgType={msg_type}, Seq={seq_num}] from client")
+                    self.in_seq_num = int(fields.get(34, self.in_seq_num)) + 1
+
+                    logger.info(f"Received [MsgType={msg_type}, Seq={fields.get(34)}] from client")
 
                     # Handle Logon (MsgType=A)
                     if msg_type == "A":
@@ -89,7 +90,7 @@ class MockExchangeServer:
 
                     # Handle Heartbeat (MsgType=0) or TestRequest (MsgType=1)
                     elif msg_type == "0":
-                        logger.info("Processed client Heartbeat.")
+                        logger.debug("Processed client Heartbeat.")
                     elif msg_type == "1":
                         test_req_id = fields.get(112)
                         hb_resp = self.build_message("0", {"112": test_req_id} if test_req_id else {})
@@ -107,24 +108,24 @@ class MockExchangeServer:
 
                         logger.info(f"NewOrderSingle received: ClOrdID={cl_ord_id}, Symbol={symbol}, Qty={order_qty}")
 
-                        # Send ExecutionReport - New (OrdStatus=0)
+                        # 1. Send ExecutionReport - New (OrdStatus=0)
                         exec_report_new = self.build_message("8", {
-                            "37": f"EXCH_ID_{cl_ord_id}",  # OrderID
+                            "37": f"EXCH_ID_{cl_ord_id}",
                             "11": cl_ord_id,
-                            "17": f"EXEC_{self.out_seq_num}",  # ExecID
+                            "17": f"EXEC_{self.out_seq_num}",
                             "150": "0",  # ExecType (0 = New)
                             "39": "0",  # OrdStatus (0 = New)
                             "55": symbol,
                             "54": side,
                             "38": order_qty,
                             "44": price,
-                            "151": order_qty,  # LeavesQty
-                            "14": "0"   # CumQty
+                            "151": order_qty, # LeavesQty
+                            "14": "0"         # CumQty
                         })
                         writer.write(exec_report_new)
                         await writer.drain()
 
-                        # Simulate immediate fill after brief pause (ExecType=2, OrdStatus=2 -> Filled)
+                        # 2. Simulate immediate fill after brief pause (ExecType=2, OrdStatus=2 -> Filled)
                         await asyncio.sleep(0.1)
                         exec_report_fill = self.build_message("8", {
                             "37": f"EXCH_ID_{cl_ord_id}",
@@ -135,10 +136,10 @@ class MockExchangeServer:
                             "55": symbol,
                             "54": side,
                             "38": order_qty,
-                            "44": price,
+                            "46": price,
                             "6": price,  # AvgPx
                             "151": "0",  # LeavesQty
-                            "14": order_qty  # CumQty
+                            "14": order_qty # CumQty
                         })
                         writer.write(exec_report_fill)
                         await writer.drain()
